@@ -6,7 +6,12 @@ import tkinter as tk
 from tkinter import scrolledtext
 
 from test import ask_lmstudio
-from lights_client import toggle_all_lights, LightsClientError, set_lights_auto
+from lights_client import (
+    get_lights_state,
+    toggle_all_lights,
+    LightsClientError,
+    set_lights_auto,
+)
 from gmail_client import search_gmail, GmailClientError
 
 # Plex sync app: run script in background and notify when done
@@ -18,7 +23,7 @@ PLEX_SYNC_MAIN = os.path.join(PLEX_SYNC_DIR, "main.py")
 class ChatApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Lori - AI Assistant")
+        self.root.title("Galadrial - AI Assistant")
         self.root.geometry("1200x700")
         self.root.minsize(1000, 600)
 
@@ -60,6 +65,14 @@ class ChatApp:
         self.root.columnconfigure(1, weight=3)  # chat
         self.root.columnconfigure(2, weight=2)  # right panel
         self.root.rowconfigure(0, weight=1)
+
+        # App icon (Evenstar); keep a reference so it isn't garbage-collected
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "201505galadriel.png")
+        if os.path.isfile(icon_path):
+            self._icon_photo = tk.PhotoImage(file=icon_path)
+            self.root.iconphoto(True, self._icon_photo)
+        else:
+            self._icon_photo = None
 
     def _build_layout(self) -> None:
         # Sidebar
@@ -123,7 +136,7 @@ class ChatApp:
 
         title_label = tk.Label(
             title_frame,
-            text="Lori",
+            text="Galadrial",
             bg=self.colors["sidebar_bg"],
             fg=self.colors["text"],
             font=("Segoe UI Semibold", 16),
@@ -553,7 +566,7 @@ class ChatApp:
 
         # Auto takes precedence if mentioned
         if "auto" in t or "automatic" in t:
-            self.append_message("System", "Setting lights to auto.")
+            self._log_event("Setting lights to auto.")
             self._set_living_room_auto()
             return "auto"
 
@@ -562,11 +575,11 @@ class ChatApp:
         has_off = " off" in t or "off " in t
 
         if has_on and not has_off:
-            self.append_message("System", "Turning lights on.")
+            self._log_event("Turning lights on.")
             self._set_living_room_state("on")
             return "on"
         elif has_off and not has_on:
-            self.append_message("System", "Turning lights off.")
+            self._log_event("Turning lights off.")
             self._set_living_room_state("off")
             return "off"
 
@@ -594,6 +607,9 @@ class ChatApp:
 
         # Lights heuristic
         if "light" in t or "lights" in t:
+            # Asking about current state (are they on? status?)
+            if any(phrase in t for phrase in ("are the", "are my", "is the", "status", "state", "check")):
+                return {"action": "lights.get_state", "params": {}}
             state: str | None = None
             if "auto" in t or "automatic" in t:
                 state = "auto"
@@ -656,7 +672,7 @@ class ChatApp:
         prev_route_json = json.dumps(self.last_route) if self.last_route is not None else "null"
 
         routing_prompt = f"""
-You are a command router for a desktop assistant called Lori.
+You are a command router for a desktop assistant called Galadrial.
 Your job is to look at the user's message and decide which ACTION to take.
 
 Valid actions:
@@ -664,6 +680,7 @@ Valid actions:
 - "lights.set_state" -> control my Govee lights.
     - params:
         - state: "on" | "off" | "auto"
+- "lights.get_state" -> check whether the lights are currently on or off (no params).
 - "plex_sync.run" -> run the user's Plex sync app (syncs media to a server). No params. Runs in the background; the app will tell the user when it finishes.
 - "gmail.search" -> search my Gmail inbox via IMAP.
     - params:
@@ -679,6 +696,7 @@ Valid actions:
 
 Rules:
 - If the user is clearly asking you to turn lights on/off/auto, use "lights.set_state".
+- If the user is asking whether the lights are on, off, or what state they are in (e.g. "are the lights on?", "light status", "are my lights on?"), use "lights.get_state".
 - If the user asks to run Plex sync, sync Plex, run the Plex sync app, start Plex sync, or similar, use "plex_sync.run".
 - If the user is asking about Gmail, email, inbox, or messages, OR is clearly asking
   about things that would usually live in email (for example: literary magazine
@@ -710,7 +728,7 @@ it is usually correct to repeat the same kind of action with similar parameters.
 
 Respond with JSON ONLY, no explanation, in this exact schema:
 {{
-  "action": "<one of: none, lights.set_state, plex_sync.run, gmail.search>",
+  "action": "<one of: none, lights.set_state, lights.get_state, plex_sync.run, gmail.search>",
   "params": {{}}
 }}
 
@@ -748,7 +766,7 @@ Previous routed action (JSON or null):
 
             cleaned = {"action": action, "params": params}
             # If the LLM returned an unknown action, fall back to heuristic routing.
-            if action not in ("none", "lights.set_state", "plex_sync.run", "gmail.search"):
+            if action not in ("none", "lights.set_state", "lights.get_state", "plex_sync.run", "gmail.search"):
                 self._log_event(
                     f"Router returned unknown action {action!r}; using heuristic router."
                 )
@@ -802,9 +820,7 @@ Previous routed action (JSON or null):
         if action == "lights.set_state":
             state = str(params.get("state", "")).lower()
             if state in ("on", "off", "auto"):
-                self.root.after(
-                    0, lambda: self.append_message("System", f"Turning lights {state}.")
-                )
+                self._log_event(f"Turning lights {state}.")
                 if state == "auto":
                     self._set_living_room_auto()
                 else:
@@ -814,6 +830,25 @@ Previous routed action (JSON or null):
             else:
                 self._log_event(f"Router gave invalid light state: {state!r}")
                 self.call_model_and_display(user_text, None)
+
+        elif action == "lights.get_state":
+            try:
+                result = get_lights_state()
+                light_state = result.get("state", "unknown")
+                msg = f"The lights are {light_state}."
+                self._log_event(msg)
+                self.call_model_and_display(
+                    user_text,
+                    None,
+                    extra_note=f"System note: The app just checked the lights; they are {light_state}.\n\n",
+                )
+            except LightsClientError as e:
+                self._log_event(f"Lights state check failed: {e}")
+                self.call_model_and_display(
+                    user_text,
+                    None,
+                    extra_note="System note: The app tried to check the lights but the request failed (e.g. endpoint not found or server error). Do NOT guess whether the lights are on or off; tell the user the check failed and they can try again or check manually.\n\n",
+                )
 
         elif action == "gmail.search":
             # Use the LLM-interpreted search query; sanitize to drop any operator-like tokens
@@ -861,14 +896,7 @@ Previous routed action (JSON or null):
             # is the source of truth.
 
         elif action == "plex_sync.run":
-            self.root.after(
-                0,
-                lambda: self.append_message(
-                    "System",
-                    "Plex sync started in the background. I'll tell you when it finishes.",
-                ),
-            )
-            self._log_event("Plex sync started (running in background).")
+            self._log_event("Plex sync started in the background.")
             threading.Thread(target=self._run_plex_sync_worker, daemon=True).start()
             self.call_model_and_display(
                 user_text,
@@ -891,7 +919,7 @@ Previous routed action (JSON or null):
         try:
             # Give the model safe context about what is and is not under its control
             system_preamble = (
-                "You are Lori, an AI assistant embedded in a desktop GUI.\n\n"
+                "You are Galadrial, an AI assistant embedded in a desktop GUI.\n\n"
                 "- The app can control my Govee lights via an API. When you see a "
                 "system note telling you that the lights were set to a state, you may "
                 "speak as if that action has already been performed.\n"
@@ -978,7 +1006,6 @@ Previous routed action (JSON or null):
             err = stderr.strip() or stdout.strip() or f"Exit code {returncode}"
             msg = f"Plex sync finished with an error: {err}"
             self._log_event(f"Plex sync error: {err}")
-        self.append_message("System", msg)
 
     # ----- Gmail integration --------------------------------------------------
 
@@ -1150,12 +1177,21 @@ Previous routed action (JSON or null):
                             + "\n".join(lines)
                         )
 
-            # Show summary in chat and event log
-            self.root.after(0, lambda: self.append_message("System", summary))
+            # Log result to Events only; have the assistant reply in chat
+            self._log_event(summary)
+            self.call_model_and_display(
+                user_question,
+                None,
+                extra_note="The app ran a Gmail search. Use this result to answer the user in one concise message. Do not repeat the raw list; summarize or answer their question.\n\nResult:\n" + summary + "\n\n",
+            )
         except GmailClientError as e:
             msg = f"Gmail error: {e}"
             self._log_event(msg)
-            self.root.after(0, lambda: self.append_message("System", msg))
+            self.call_model_and_display(
+                user_question,
+                None,
+                extra_note="System note: The app tried to search Gmail but failed. Tell the user briefly that the search failed and they can try again.\n\n",
+            )
 
 
 def main() -> None:
