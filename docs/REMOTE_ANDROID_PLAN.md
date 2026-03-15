@@ -1,6 +1,10 @@
-# Remote Android + FastAPI Plan (Tailscale)
+# Remote Android + FastAPI Plan
 
-Use Galadrial from your Android device: the app sends a message to a FastAPI server on your PC; the server runs routing, tools, and the LLM (LM Studio) and returns the assistant’s reply.
+Use Galadrial from a web browser (or later from Android): the client sends a message to a FastAPI server on your PC; the server runs routing, tools, and the LLM (LM Studio) and returns the assistant’s reply.
+
+**Current setup:** Local only. Run the API server on your PC and open **http://localhost:8000/** in a browser on the same machine. No Tailscale or remote access.
+
+**Implement later:** Tailscale (and/or API key) when you want to use the web client from your phone or another device. See section 6 and the end of the doc.
 
 ---
 
@@ -18,7 +22,7 @@ Use Galadrial from your Android device: the app sends a message to a FastAPI ser
 
 - **Android**: Only needs to HTTP POST the user message and show the reply. No LLM or tools on the phone.
 - **PC**: Runs FastAPI (same process can also run the Tk desktop app, or you run the server separately). FastAPI calls LM Studio at `localhost:1234` and runs lights/Gmail/Plex tools on the PC.
-- **Tailscale**: Both devices join the same Tailscale network. Android uses the PC’s Tailscale IP or hostname (e.g. `http://100.x.x.x:8000`) so no port forwarding or public IP is needed.
+- **Tailscale (optional, later):** When you want remote access, both devices join the same Tailscale network. Android would use the PC’s Tailscale IP (e.g. `http://100.x.x.x:8000`). For now, use **http://localhost:8000/** on the PC only.
 
 ---
 
@@ -97,13 +101,14 @@ Start with A or C to validate the API and Tailscale; add B if you want a dedicat
 
 ---
 
-## 6. Tailscale Setup
+## 6. Tailscale (implement later)
 
-- **PC**: Install Tailscale, log in. Note the machine’s Tailscale IP (e.g. `100.x.x.x`) or hostname (e.g. `my-pc.tailnet-name.ts.net`).
-- **Android**: Install Tailscale from Play Store, same account (or same tailnet). No need to expose ports; the phone and PC can talk over Tailscale.
-- **Firewall**: On PC, allow inbound TCP to the port FastAPI uses (e.g. 8000). Tailscale doesn’t change that.
+When you want to use the web client from your phone or another device:
 
-**Testing**: From the Android browser or app, open `http://<PC_TAILSCALE_IP>:8000/health` (or similar); then POST to `/chat` with a test message.
+- **PC**: Install Tailscale, log in. Note the machine’s Tailscale IP (e.g. `100.x.x.x`) or hostname.
+- **Android**: Install Tailscale from Play Store, same account (or same tailnet). No port forwarding needed; phone and PC talk over Tailscale.
+- **Firewall**: On PC, allow inbound TCP to the port FastAPI uses (e.g. 8000).
+- **Testing**: From the phone’s browser, open `http://<PC_TAILSCALE_IP>:8000/` and send a message.
 
 ---
 
@@ -138,4 +143,4 @@ Start with A or C to validate the API and Tailscale; add B if you want a dedicat
 - **Android**: Thin client that sends the message and shows the reply over Tailscale.
 - **Tailscale**: Private network so the phone can reach the PC without opening your home router.
 
-Next concrete step: implement the engine refactor and a minimal `POST /chat` FastAPI endpoint, then test from the PC with `curl` before testing from Android.
+**Done:** Engine, FastAPI server, and web client are implemented. Use **http://localhost:8000/** for local-only. Add Tailscale and/or API key when you need remote access.
