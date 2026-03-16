@@ -1,5 +1,6 @@
 # Desktop app + engine (LM Studio, lights, Gmail)
 requests>=2.28.0
+nanoleafapi>=2.1.0
 
 # API server (optional: only needed for remote Android / web client)
 fastapi>=0.100.0

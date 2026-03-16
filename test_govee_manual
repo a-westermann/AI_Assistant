@@ -1,0 +1,13 @@
+# H:\Coding\AI_assistant\test_govee_manual.py
+from lights_client import set_lights_style
+
+# 1) Simple on only
+set_lights_style(state="on")
+
+# 2) Warm romantic-ish: soft warm white at 40% brightness
+set_lights_style(
+    state="on",
+    color_hex="#ffb3a7",
+    color_temp_k=2700,
+    brightness=40,
+)

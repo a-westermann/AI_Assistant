@@ -15,7 +15,9 @@ from lights_client import (
     toggle_all_lights,
     LightsClientError,
     set_lights_auto,
+    set_lights_style,
 )
+from nanoleaf import nanoleaf
 from gmail_client import search_gmail, GmailClientError
 
 # Plex sync (same as chat_gui; override with PLEX_SYNC_DIR env if needed)
@@ -25,6 +27,81 @@ PLEX_SYNC_MAIN = os.path.join(PLEX_SYNC_DIR, "main.py")
 
 # Gmail broad-term filter for list searches
 _GENERIC_BROAD_TERMS = {"review", "feature", "contract"}
+
+# Tools the assistant can use. The model sees these and chooses one based on the user's intent.
+TOOLS = [
+    {
+        "name": "none",
+        "description": "No tool. Use when the user is just chatting, asking a general question, or when no other tool fits.",
+        "params": [],
+    },
+    {
+        "name": "lights.set_state",
+        "description": "Turn BOTH Govee and Nanoleaf lights on, off, or set Govee to automatic mode. Use only when the user explicitly says on, off, or auto/automatic—not for moods or scenes.",
+        "params": [{"name": "state", "type": "string", "description": "One of: on, off, auto"}],
+    },
+    {
+        "name": "lights.set_scene",
+        "description": "Set BOTH Govee and Nanoleaf to a mood or atmosphere. Use when the user asks to change how the lights feel: romantic, peaceful, cozy, somber, pulse, gentle, brighter, faster, or any vibe/intent (e.g. 'add a gentle pulse', 'make them pulse faster and brighter'). We set color and brightness to match; there is no real pulse effect. params.description = the user's full request or mood.",
+        "params": [{"name": "description", "type": "string", "description": "The mood or full request (e.g. romantic, somber, gentle pulse, make them brighter)"}],
+    },
+    {
+        "name": "lights.get_state",
+        "description": "Check whether Govee lights are currently on or off. Use when the user asks about light status or whether the lights are on.",
+        "params": [],
+    },
+    {
+        "name": "plex_sync.run",
+        "description": "Run the Plex sync app (syncs media to a server) in the background. Use when the user asks to run Plex sync, sync Plex, or start Plex sync.",
+        "params": [],
+    },
+    {
+        "name": "gmail.search",
+        "description": "Search the user's Gmail inbox. Use when they ask about email, inbox, messages, or things that would be in email (e.g. literary magazine submissions, acceptances).",
+        "params": [
+            {"name": "query", "type": "string", "description": "Short search terms (plain words, no operators)"},
+            {"name": "scope", "type": "string", "description": "unread or all"},
+            {"name": "result_type", "type": "string", "description": "count or list"},
+            {"name": "category", "type": "string", "description": "Optional: updates, primary, promotions, social, forums"},
+            {"name": "broad_search_terms", "type": "array", "description": "Optional: list of terms for list searches to widen results"},
+        ],
+    },
+    {
+        "name": "nanoleaf.set_scene",
+        "description": "Set ONLY the Nanoleaf panels to a predefined SCENE from the list (e.g. Romantic, Northern Lights, Inner Peace). Use when the user asks for a mood that fits a scene name. Do NOT use for: pulse, 'add a pulse', breathing, 'custom', 'without using scenes', 'make up your own'—use nanoleaf.custom for those.",
+        "params": [{"name": "description", "type": "string", "description": "The mood that should match a scene name (e.g. romantic, peaceful)"}],
+    },
+    {
+        "name": "nanoleaf.custom",
+        "description": "Set BOTH Govee and Nanoleaf from a custom/pulse-style request. Use when the user asks for a pulse, 'add a pulse', 'strong pulse', animation, rhythm, or says 'without using the scenes list' / 'make up your own settings' / 'custom'. Nanoleaf can show real animations (we pick a pulse/animation scene if one fits); Govee can only do a single static color and brightness (no animation). Do NOT use for a simple mood that matches a scene—use nanoleaf.set_scene or lights.set_scene instead.",
+        "params": [{"name": "description", "type": "string", "description": "The request (e.g. strong pulse, gentle pulse, custom somber, make up your own)"}],
+    },
+    {
+        "name": "nanoleaf.create_animation",
+        "description": "CREATE AND APPLY a new animation on the NANOLEAF panels only (e.g. a flowing cycle of colors). The app will run this on the Nanoleaf—do NOT reply with manual instructions for the user. Use when the user says: create a new animation, create an animation for the lights, new animation for lighting, make a flowing effect, cycle through colors, or design an animation. Pick 2–6 colors (hex) and optional speed; use animation_type 'flow', params.colors (e.g. [\"#FF0000\", \"#00FF00\"]), params.speed 0.5–5. Never respond with text telling the user to set Govee in an app—use this tool to apply on Nanoleaf.",
+        "params": [
+            {"name": "animation_type", "type": "string", "description": "One of: flow"},
+            {"name": "colors", "type": "array", "description": "List of hex color strings, e.g. [\"#FF0000\", \"#00FF00\", \"#0000FF\"]. Need at least 2 for flow."},
+            {"name": "speed", "type": "number", "description": "Optional. Transition speed 0.5–5 (seconds). Default 1."},
+        ],
+    },
+]
+
+VALID_ACTIONS = {t["name"] for t in TOOLS}
+
+
+def _format_tools_for_prompt() -> str:
+    """Format TOOLS into a string for the LLM prompt."""
+    lines = []
+    for t in TOOLS:
+        params_str = ""
+        if t["params"]:
+            params_str = " Parameters: " + ", ".join(
+                f'{p["name"]} ({p["type"]})' + (f": {p['description']}" if p.get("description") else "")
+                for p in t["params"]
+            )
+        lines.append(f'- {t["name"]}: {t["description"]}{params_str}')
+    return "\n".join(lines)
 
 
 def _default_log(_msg: str) -> None:
@@ -43,149 +120,208 @@ class AssistantEngine:
         self.last_route: dict | None = None
         self.last_user_message: str | None = None
 
+    def _route_speed_adjust(self, user_text: str) -> dict | None:
+        """If the user is asking to change animation speed and last action was nanoleaf.create_animation, return a route that re-applies the same animation with new speed. Otherwise return None."""
+        if self.last_route is None or self.last_route.get("action") != "nanoleaf.create_animation":
+            return None
+        prev_params = self.last_route.get("params") or {}
+        colors = prev_params.get("colors")
+        if not isinstance(colors, list) or len(colors) < 2:
+            return None
+        t = user_text.lower().strip()
+        try:
+            current = float(prev_params.get("speed", 1.0))
+        except (TypeError, ValueError):
+            current = 1.0
+        current = max(0.5, min(5.0, current))
+        # Faster: lower numeric speed = faster transition in our API
+        if any(
+            phrase in t
+            for phrase in (
+                "super fast",
+                "really fast",
+                "maximum speed",
+                "max speed",
+                "faster",
+                "speed it up",
+                "speed up",
+                "a little faster",
+                "make it faster",
+                "flow faster",
+            )
+        ):
+            if "super" in t or "really fast" in t or "max" in t:
+                new_speed = 0.5
+            elif "a little" in t:
+                new_speed = max(0.5, round(current * 0.75, 1))
+            else:
+                new_speed = max(0.5, round(current * 0.55, 1))
+            return {
+                "action": "nanoleaf.create_animation",
+                "params": {
+                    "animation_type": "flow",
+                    "colors": colors,
+                    "speed": new_speed,
+                },
+            }
+        # Slower: higher numeric speed = slower transition
+        if any(
+            phrase in t
+            for phrase in (
+                "slower",
+                "slow it down",
+                "slow down",
+                "a little slower",
+                "make it slower",
+                "more slowly",
+                "gentler",
+            )
+        ):
+            if "a little" in t:
+                new_speed = min(5.0, round(current * 1.25, 1))
+            else:
+                new_speed = min(5.0, round(current * 1.6, 1))
+            return {
+                "action": "nanoleaf.create_animation",
+                "params": {
+                    "animation_type": "flow",
+                    "colors": colors,
+                    "speed": new_speed,
+                },
+            }
+        return None
+
+    def _route_animation_color_change(self, user_text: str) -> dict | None:
+        """If the user is asking to change the lights to a single color (e.g. 'make the lights yellow'), return nanoleaf.create_animation with that color so we get a yellow flow on Nanoleaf instead of a scene. Reuse previous speed if last action was create_animation, else default 1.0."""
+        prev_params = (self.last_route or {}).get("params") or {} if self.last_route and self.last_route.get("action") == "nanoleaf.create_animation" else {}
+        try:
+            speed = float(prev_params.get("speed", 1.0))
+        except (TypeError, ValueError):
+            speed = 1.0
+        speed = max(0.5, min(5.0, speed))
+        t = user_text.lower().strip()
+        # "make the lights yellow", "make them yellow", "make it blue", "change to red", "turn them green"
+        color_words = {
+            "yellow": ["#FFFF00", "#FFD700"],
+            "gold": ["#FFD700", "#FFA500"],
+            "blue": ["#0066FF", "#3399FF"],
+            "red": ["#FF0000", "#CC0000"],
+            "green": ["#00FF00", "#00CC00"],
+            "orange": ["#FF8C00", "#FFA500"],
+            "purple": ["#800080", "#9932CC"],
+            "violet": ["#EE82EE", "#9932CC"],
+            "pink": ["#FF69B4", "#FFB6C1"],
+            "white": ["#FFFFFF", "#E8E8E8"],
+            "cyan": ["#00FFFF", "#40E0D0"],
+            "teal": ["#008080", "#20B2AA"],
+            "indigo": ["#4B0082", "#6A0DAD"],
+            "amber": ["#FFBF00", "#FF8C00"],
+        }
+        for word, hexes in color_words.items():
+            if word in t and any(
+                phrase in t
+                for phrase in (
+                    "make them", "make it", "make the lights", "make the light",
+                    "change to", "turn them", "turn it", "set them", "set it",
+                    "want ", "go ", "switch to", "make the", "them ", "lights ",
+                )
+            ):
+                return {
+                    "action": "nanoleaf.create_animation",
+                    "params": {
+                        "animation_type": "flow",
+                        "colors": hexes,
+                        "speed": speed,
+                    },
+                }
+        # Also catch "make them <color>" when color is at end
+        for word, hexes in color_words.items():
+            if t.endswith(word) or t.endswith(word + ".") or f" {word}" in t or f" {word}." in t:
+                if len(t) < 50 and not t.startswith("set the nanoleaf") and "scene" not in t:
+                    return {
+                        "action": "nanoleaf.create_animation",
+                        "params": {
+                            "animation_type": "flow",
+                            "colors": hexes,
+                            "speed": speed,
+                        },
+                    }
+        return None
+
     def route(self, user_text: str) -> dict:
-        """Return {action, params} for the user message (LLM + heuristic fallback)."""
+        """Return {action, params} by asking the model to choose a tool from TOOLS based on the user's intent. No keyword routing."""
         prev_msg = self.last_user_message or ""
-        prev_route_json = json.dumps(self.last_route) if self.last_route is not None else "null"
+        prev_action = json.dumps(self.last_route) if self.last_route is not None else "null"
+        # If user wants to change animation speed and we have a previous create_animation, reuse it with new speed so we actually apply
+        speed_route = self._route_speed_adjust(user_text)
+        if speed_route is not None:
+            self.log(f"Router decided action (speed adjust): {speed_route}")
+            return speed_route
+        # If user asks to change the animation color (e.g. "make them yellow") and we're already in a flow, keep the flow and just change colors—don't switch to a scene
+        color_route = self._route_animation_color_change(user_text)
+        if color_route is not None:
+            self.log(f"Router decided action (animation color change): {color_route}")
+            return color_route
+        tools_blob = _format_tools_for_prompt()
 
-        routing_prompt = f"""
-You are a command router for a desktop assistant called Galadrial.
-Your job is to look at the user's message and decide which ACTION to take.
+        tool_choice_prompt = f"""You are Galadrial, a desktop assistant. You have access to these tools. Interpret the user's message and choose ONE tool (or "none" only if they are clearly just chatting, not asking you to do something).
 
-Valid actions:
-- "none"  -> no side effects, just chat with the user.
-- "lights.set_state" -> control my Govee lights.
-    - params:
-        - state: "on" | "off" | "auto"
-- "lights.get_state" -> check whether the lights are currently on or off (no params).
-- "plex_sync.run" -> run the user's Plex sync app (syncs media to a server). No params. Runs in the background; the app will tell the user when it finishes.
-- "gmail.search" -> search my Gmail inbox via IMAP.
-    - params:
-        - query: string   (the search terms to send to Gmail—YOU interpret the user's intent)
-        - scope: "unread" | "all"
-        - result_type: "count" | "list"
-        - category: one of "updates", "primary", "promotions", "social", "forums" (optional)
-        - broad_search_terms: optional array of 2–6 short terms for "list" searches. When the user
-          is asking to find/look through emails (e.g. "last email about X", "any acceptance from
-          a literary mag"), set this to words that might appear in such emails so we cast a wider
-          net (e.g. ["submission", "accepted", "acceptance", "literary", "magazine"]). Omit for
-          count-only or when the user's query is already narrow.
+TOOLS:
+{tools_blob}
 
-Rules:
-- If the user is clearly asking you to turn lights on/off/auto, use "lights.set_state".
-- If the user is asking whether the lights are on, off, or what state they are in (e.g. "are the lights on?", "light status", "are my lights on?"), use "lights.get_state".
-- If the user asks to run Plex sync, sync Plex, run the Plex sync app, start Plex sync, or similar, use "plex_sync.run".
-- If the user is asking about Gmail, email, inbox, or messages, OR is clearly asking
-  about things that would usually live in email (for example: literary magazine
-  submissions, acceptances/rejections, stories being accepted, submission platforms
-  like Submittable or Moksha), use "gmail.search".
-  - For gmail.search, set params.query to a SHORT search string that expresses what
-    to find. Interpret the user's message: e.g. "last email about literary mag
-    submission being accepted" -> "submission accepted literary magazine"; "how many
-    unread in Promotions" -> "promotions" or "unread". Use plain words only (no
-    subject:, from:, or other operators). This query is sent directly to Gmail.
-  - For result_type "list" when the user is asking to find or look through emails
-    (e.g. "what's the last email about X", "any acceptance from a literary magazine"),
-    also set params.broad_search_terms to an array of 2–8 terms that might appear in
-    relevant emails. Include wording that appears in acceptance emails, not just
-    rejections: e.g. "feature", "publish", "edits" (as in "work with me on edits"),
-    "accepted", "acceptance", "submission", "literary", "magazine". We
-    search with OR and then use the model to pick which emails actually match.
-  - If the user clearly refers to a specific Gmail category such as "Updates",
-    "Promotions", "Primary", "Social", or "Forums", set params.category to the
-    corresponding lowercase name (e.g. "Updates" -> "updates").
-  - Choose "unread" when they ask about unread, new, or recent mail; otherwise "all".
-  - Choose "count" when they ask "how many", "number of", or clearly request a count.
-  - Otherwise choose "list".
-- If the message is purely conversational or does not match any tool, use "none".
+Interpret intent from the actual request. Examples:
+- "set the lights to romantic" / "romantic feel" / "make it cozy" / "add a gentle pulse" / "make them pulse faster and brighter" → lights.set_scene (params.description = their request or mood)
+- "set the nanoleaf to romantic" (mood that matches a scene) → nanoleaf.set_scene
+- "add a strong pulse to the nanoleaf" / "pulse" / "without using the scenes list" / "make up your own settings" → nanoleaf.custom (custom color/brightness, no scene)
+- "create a new animation" / "create a new animation for the lights" / "create an animation for lighting" / "make a flow of red and blue" → nanoleaf.create_animation. You MUST call this tool and supply colors (and optional speed); the app will apply it to the Nanoleaf. Do NOT choose "none" or reply with manual instructions for Govee or any app.
+- "make it faster" / "speed it up" / "super fast" / "slower" / "slow it down" (when previous action was nanoleaf.create_animation) → nanoleaf.create_animation again with the SAME colors from the previous action and a NEW speed (faster = lower speed number e.g. 0.5, slower = higher e.g. 2). You must call the tool, not just describe the change.
+- "make the lights yellow" / "make them yellow" / "make it blue" / "change to red" → nanoleaf.create_animation with that color as params.colors (e.g. ["#FFFF00", "#FFD700"]). Do NOT use lights.set_scene or nanoleaf.set_scene for a single-color request—use nanoleaf.create_animation so Nanoleaf shows a flowing animation in that color.
+- "turn lights on" / "lights off" → lights.set_state with state "on" or "off"
+- "are the lights on?" → lights.get_state
+- "run Plex sync" → plex_sync.run
+- "check my email for X" → gmail.search with query/scope/result_type
 
-You may use the previous user message and previous action to interpret short
-follow-ups like "again", "same thing", or "check that for me". In those cases,
-it is usually correct to repeat the same kind of action with similar parameters.
+If the user said "again" or "same thing", repeat the previous action. Do not choose "none" when the user is asking you to change the lights or set a mood—use lights.set_scene or nanoleaf.set_scene as appropriate. If they ask to "create a new animation" or "create an animation for the lights", always use nanoleaf.create_animation with colors (and optional speed)—never respond with a list of settings for them to enter in an app.
 
-Respond with JSON ONLY, no explanation, in this exact schema:
-{{
-  "action": "<one of: none, lights.set_state, lights.get_state, plex_sync.run, gmail.search>",
-  "params": {{}}
-}}
+Previous user message: "{prev_msg}"
+Previous action: {prev_action}
 
-User message:
-\"\"\"
-{user_text}
-\"\"\"
+User message: "{user_text}"
 
-Previous user message:
-\"\"\"
-{prev_msg}
-\"\"\"
-
-Previous routed action (JSON or null):
-{prev_route_json}
+Respond with JSON only:
+{{"action": "<tool name from the list above>", "params": {{...}}}}
 """
         try:
-            response = ask_lmstudio(routing_prompt)
+            response = ask_lmstudio(tool_choice_prompt)
             raw = response["output"][0]["content"].strip()
             if raw.startswith("```"):
                 parts = raw.split("```")
-                if len(parts) >= 3:
+                if len(parts) >= 2:
                     raw = parts[1].strip()
             route = json.loads(raw)
             if not isinstance(route, dict):
-                raise ValueError("Routing output was not a JSON object")
+                raise ValueError("Response was not a JSON object")
             action = str(route.get("action", "none")).strip() or "none"
-            params = route.get("params") or {}
-            if not isinstance(params, dict):
-                params = {}
+            params = route.get("params") if isinstance(route.get("params"), dict) else {}
             cleaned = {"action": action, "params": params}
-            if action not in ("none", "lights.set_state", "lights.get_state", "plex_sync.run", "gmail.search"):
-                self.log(f"Router returned unknown action {action!r}; using heuristic router.")
+            if action not in VALID_ACTIONS:
+                self.log(f"Model returned unknown action {action!r}; using fallback.")
                 cleaned = self._heuristic_route(user_text)
             self.log(f"Router decided action: {cleaned}")
             return cleaned
         except Exception as e:
-            self.log(f"Routing failed; using heuristic router instead: {e}")
+            self.log(f"Tool choice failed ({e}); using fallback.")
             cleaned = self._heuristic_route(user_text)
-            self.log(f"Heuristic router decided action: {cleaned}")
+            self.log(f"Router decided action: {cleaned}")
             return cleaned
 
     def _heuristic_route(self, user_text: str) -> dict:
+        """Used only when the model fails or returns an unknown action. Minimal: repeat last action or none."""
         t = user_text.lower()
         if self.last_route is not None and any(
             phrase in t for phrase in ("again", "same thing", "do that", "check again")
         ):
             return self.last_route
-        if "plex" in t and "sync" in t:
-            return {"action": "plex_sync.run", "params": {}}
-        if "light" in t or "lights" in t:
-            if any(phrase in t for phrase in ("are the", "are my", "is the", "status", "state", "check")):
-                return {"action": "lights.get_state", "params": {}}
-            state = None
-            if "auto" in t or "automatic" in t:
-                state = "auto"
-            elif "on" in t and "off" not in t:
-                state = "on"
-            elif "off" in t and "on" not in t:
-                state = "off"
-            if state is not None:
-                return {"action": "lights.set_state", "params": {"state": state}}
-        if any(w in t for w in ("gmail", "email", "inbox", "mail", "submittable", "moksha")):
-            scope = "unread" if any(w in t for w in ("unread", "new", "recent")) else "all"
-            result_type = "count" if any(w in t for w in ("how many", "number of", "count")) else "list"
-            category = None
-            if "updates" in t:
-                category = "updates"
-            elif "promotions" in t:
-                category = "promotions"
-            elif "primary" in t:
-                category = "primary"
-            elif "social" in t:
-                category = "social"
-            elif "forums" in t:
-                category = "forums"
-            params = {"query": user_text, "scope": scope, "result_type": result_type}
-            if category is not None:
-                params["category"] = category
-            return {"action": "gmail.search", "params": params}
         return {"action": "none", "params": {}}
 
     def _call_model(self, prompt: str, light_action: str | None = None, extra_note: str = "") -> str:
@@ -361,6 +497,141 @@ Previous routed action (JSON or null):
             extra_note="The app ran a Gmail search. Use this result to answer the user in one concise message. Do not repeat the raw list; summarize or answer their question.\n\nResult:\n" + summary + "\n\n",
         )
 
+    def _pick_govee_style(self, description: str) -> dict | None:
+        """Ask LLM for color_hex, color_temp_k, brightness that fit the mood. Returns dict or None."""
+        prompt = (
+            f'The user wants their room lights to feel "{description}".\n\n'
+            "Suggest settings for a smart bulb: color (hex #RRGGBB), color temperature in Kelvin (2200–3000 warm, 4000–6500 cool), and brightness 0–100. "
+            "You MUST always include brightness. If they say dimmer, dim, or dark use brightness 25–45; if they say brighter or bright use 75–100; otherwise 50–70. "
+            "Reply with JSON only, no explanation:\n"
+            '{"color_hex": "#RRGGBB", "color_temp_k": 2700, "brightness": 70}'
+        )
+        try:
+            response = ask_lmstudio(prompt)
+            raw = (response.get("output") or [{}])[0].get("content", "").strip()
+            if not raw:
+                return None
+            if raw.startswith("```"):
+                parts = raw.split("```")
+                if len(parts) >= 2:
+                    raw = parts[1].strip()
+            obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                return None
+            color_hex = obj.get("color_hex")
+            color_temp_k = obj.get("color_temp_k")
+            brightness = obj.get("brightness")
+            if color_hex is None and color_temp_k is None and brightness is None:
+                return None
+            out = {}
+            if color_hex is not None:
+                s = str(color_hex).strip()
+                if s.startswith("#") and len(s) == 7:
+                    out["color_hex"] = s
+            if color_temp_k is not None:
+                try:
+                    out["color_temp_k"] = max(2200, min(6500, int(color_temp_k)))
+                except (TypeError, ValueError):
+                    pass
+            if brightness is not None:
+                try:
+                    out["brightness"] = max(0, min(100, int(brightness)))
+                except (TypeError, ValueError):
+                    pass
+            # If we have any style but LLM omitted brightness, infer from description so dimmer/brighter are applied
+            if out and out.get("brightness") is None:
+                d = description.lower()
+                if any(w in d for w in ("dim", "dark", "darker", "low")):
+                    out["brightness"] = 35
+                elif any(w in d for w in ("bright", "brighter", "lighter", "high")):
+                    out["brightness"] = 85
+                else:
+                    out["brightness"] = 65
+            return out if out else None
+        except Exception as e:
+            self.log(f"Govee style pick failed: {e}")
+            return None
+
+    def _pick_nanoleaf_style(self, description: str) -> dict | None:
+        """Ask LLM for color_hex and brightness for Nanoleaf panels to match the mood. Returns dict or None."""
+        prompt = (
+            f'The user wants their Nanoleaf panels to feel "{description}".\n\n'
+            "Suggest a single color (hex #RRGGBB) and brightness (0–100). You MUST always include brightness. "
+            "If they say dimmer, dim, or dark use brightness 25–45; if they say brighter or bright use 75–100; otherwise 50–70. "
+            "Reply with JSON only, no explanation:\n"
+            '{"color_hex": "#RRGGBB", "brightness": 60}'
+        )
+        try:
+            response = ask_lmstudio(prompt)
+            raw = (response.get("output") or [{}])[0].get("content", "").strip()
+            if not raw:
+                return None
+            if raw.startswith("```"):
+                parts = raw.split("```")
+                if len(parts) >= 2:
+                    raw = parts[1].strip()
+            obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                return None
+            out = {}
+            color_hex = obj.get("color_hex")
+            if color_hex is not None:
+                s = str(color_hex).strip()
+                if s.startswith("#") and len(s) == 7:
+                    out["color_hex"] = s
+            brightness = obj.get("brightness")
+            if brightness is not None:
+                try:
+                    out["brightness"] = max(0, min(100, int(brightness)))
+                except (TypeError, ValueError):
+                    pass
+            # If we have color but LLM omitted brightness, infer from description
+            if out and out.get("brightness") is None:
+                d = description.lower()
+                if any(w in d for w in ("dim", "dark", "darker", "low")):
+                    out["brightness"] = 35
+                elif any(w in d for w in ("bright", "brighter", "lighter", "high")):
+                    out["brightness"] = 85
+                else:
+                    out["brightness"] = 60
+            return out if out else None
+        except Exception as e:
+            self.log(f"Nanoleaf style pick failed: {e}")
+            return None
+
+    def _pick_nanoleaf_scene(self, description: str, scene_list: list[str]) -> str | None:
+        """Use the LLM to pick the scene that best matches the user's mood or intent (e.g. 'sexy' -> Romantic)."""
+        if not scene_list or not description.strip():
+            return None
+        scene_list_str = ", ".join(scene_list)
+        prompt = (
+            f"Available Nanoleaf scene names (pick exactly one):\n{scene_list_str}\n\n"
+            f"The user said they want: \"{description.strip()}\"\n\n"
+            "They may use words that are not exact scene names (e.g. 'sexy', 'chill', 'cozy', 'intimate'). "
+            "Choose the scene that best fits the mood or feeling they are describing. "
+            "For example, 'sexy' or 'intimate' are similar to Romantic; 'calm' might match Inner Peace or Snowfall. "
+            "Reply with ONLY the single scene name from the list above—no explanation, no quotes, just the name."
+        )
+        try:
+            response = ask_lmstudio(prompt)
+            raw = (response.get("output") or [{}])[0].get("content", "").strip()
+            if not raw:
+                return None
+            # Take first line and strip quotes
+            first_line = raw.split("\n")[0].strip().strip('"\'')
+            first_line_lower = first_line.lower()
+            for name in scene_list:
+                if name.lower() == first_line_lower:
+                    return name
+            # Partial match (e.g. "Inner Peace" in "Inner Peace")
+            for name in scene_list:
+                if name.lower() in first_line_lower or first_line_lower in name.lower():
+                    return name
+            return None
+        except Exception as e:
+            self.log(f"Nanoleaf scene pick failed: {e}")
+            return None
+
     def _run_plex_sync_background(self) -> None:
         try:
             if not os.path.isdir(PLEX_SYNC_DIR) or not os.path.isfile(PLEX_SYNC_MAIN):
@@ -394,8 +665,16 @@ Previous routed action (JSON or null):
                 self.log(f"Turning lights {state}.")
                 if state == "auto":
                     set_lights_auto()
+                    # Nanoleaf has no auto mode; leave as-is or could turn off—leaving as-is
                 else:
                     toggle_all_lights("on" if state == "on" else "off")
+                    try:
+                        if state == "on":
+                            nanoleaf.turn_on()
+                        else:
+                            nanoleaf.turn_off()
+                    except Exception as e:
+                        self.log(f"Nanoleaf set_state {state} failed: {e}")
                 return self._call_model(user_text, state)
             return self._call_model(user_text, None)
 
@@ -416,6 +695,89 @@ Previous routed action (JSON or null):
                     None,
                     extra_note="System note: The app tried to check the lights but the request failed. Do NOT guess; tell the user the check failed and they can try again.\n\n",
                 )
+
+        if action == "lights.set_scene":
+            description = str(params.get("description") or user_text).strip()
+            govee_ok = False
+            govee_note = ""
+            style = self._pick_govee_style(description)
+            if style:
+                try:
+                    set_lights_style(state="on", **style)
+                    govee_ok = True
+                    parts = ["Govee lights set to match the mood"]
+                    if style.get("color_hex"):
+                        parts.append(f"(color {style['color_hex']})")
+                    if style.get("brightness") is not None:
+                        parts.append(f"brightness {style['brightness']}%")
+                    govee_note = " ".join(parts) + "."
+                    self.log(govee_note)
+                except LightsClientError as e:
+                    self.log(f"Govee set_style failed: {e}; falling back to on only.")
+                    try:
+                        toggle_all_lights("on")
+                        govee_ok = True
+                        govee_note = "Govee lights turned on (style endpoint unavailable)."
+                    except LightsClientError:
+                        pass
+            else:
+                try:
+                    toggle_all_lights("on")
+                    govee_ok = True
+                    govee_note = "Govee lights turned on."
+                    self.log("Govee lights turned on.")
+                except LightsClientError as e:
+                    self.log(f"Govee on failed: {e}")
+            scenes = nanoleaf.get_scene_list()
+            nanoleaf_note = ""
+            chosen = self._pick_nanoleaf_scene(description, scenes) if scenes else None
+            if chosen:
+                try:
+                    nanoleaf.turn_on()
+                    nanoleaf.set_effect(chosen)
+                    self.log(f"Nanoleaf scene set to {chosen!r}.")
+                    nanoleaf_note = f"Nanoleaf panels set to scene \"{chosen}\"."
+                    # If user asked for dimmer/brighter, apply brightness on top of the scene
+                    desc_lower = description.lower()
+                    if any(w in desc_lower for w in ("dim", "bright", "brightness", "darker", "lighter", "low", "high")):
+                        nl_style = self._pick_nanoleaf_style(description)
+                        if nl_style and nl_style.get("brightness") is not None:
+                            try:
+                                nanoleaf.set_brightness(nl_style["brightness"])
+                                nanoleaf_note += f" Brightness set to {nl_style['brightness']}%."
+                            except Exception:
+                                pass
+                except Exception as e:
+                    self.log(f"Nanoleaf set_effect failed: {e}")
+                    nanoleaf_note = f"Failed to set Nanoleaf to \"{chosen}\" (panels may be unreachable)."
+            else:
+                # No matching scene: let the LLM pick a color and brightness that fit the mood
+                style = self._pick_nanoleaf_style(description)
+                if style:
+                    try:
+                        nanoleaf.turn_on()
+                        if style.get("color_hex"):
+                            h = style["color_hex"]
+                            r, g, b = int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+                            nanoleaf.set_color_rgb(r, g, b)
+                        if style.get("brightness") is not None:
+                            nanoleaf.set_brightness(style["brightness"])
+                        self.log("Nanoleaf set to custom color/brightness for mood.")
+                        nanoleaf_note = "Nanoleaf panels set to a custom color and brightness to match the mood."
+                    except Exception as e:
+                        self.log(f"Nanoleaf style failed: {e}")
+                        nanoleaf_note = "Could not set Nanoleaf color/brightness (panels may be unreachable)."
+                else:
+                    nanoleaf_note = "No matching Nanoleaf scene and could not pick a custom color; try a different description."
+            parts = []
+            if govee_ok and govee_note:
+                parts.append(govee_note)
+            elif govee_ok:
+                parts.append("Govee lights are on.")
+            if nanoleaf_note:
+                parts.append(nanoleaf_note)
+            extra_note = "System note: " + " ".join(parts) + "\n\n"
+            return self._call_model(user_text, None, extra_note=extra_note)
 
         if action == "gmail.search":
             raw_query = str(params.get("query") or user_text).strip()
@@ -444,6 +806,141 @@ Previous routed action (JSON or null):
             else:
                 broad_terms = None
             return self._search_gmail_sync(user_text, query, scope, result_type, category, broad_terms)
+
+        if action == "nanoleaf.set_scene":
+            description = str(params.get("description") or user_text).strip()
+            scenes = nanoleaf.get_scene_list()
+            if not scenes:
+                return self._call_model(
+                    user_text,
+                    None,
+                    extra_note="System note: The app could not read the Nanoleaf scenes list (scenes.txt). Tell the user to add scene names to nanoleaf/scenes.txt.\n\n",
+                )
+            chosen = self._pick_nanoleaf_scene(description, scenes)
+            if not chosen:
+                return self._call_model(
+                    user_text,
+                    None,
+                    extra_note="System note: The app could not pick a matching Nanoleaf scene from the list. Suggest the user try a different description or use 'custom' for a pulse/custom look.\n\n",
+                )
+            try:
+                nanoleaf.turn_on()
+                nanoleaf.set_effect(chosen)
+                self.log(f"Nanoleaf scene set to {chosen!r}.")
+                return self._call_model(
+                    user_text,
+                    None,
+                    extra_note=f"System note: The app has set the Nanoleaf panels to the scene \"{chosen}\".\n\n",
+                )
+            except Exception as e:
+                self.log(f"Nanoleaf set_effect failed: {e}")
+                return self._call_model(
+                    user_text,
+                    None,
+                    extra_note=f"System note: The app tried to set the Nanoleaf scene to \"{chosen}\" but the request failed. Tell the user to check the panels are on and reachable.\n\n",
+                )
+
+        if action == "nanoleaf.custom":
+            description = str(params.get("description") or user_text).strip()
+            govee_style = self._pick_govee_style(description)
+            scenes = nanoleaf.get_scene_list()
+            # Try an animated/pulse scene for Nanoleaf when user asks for pulse, animation, rhythm, etc.
+            nanoleaf_scene = None
+            if scenes and any(w in description.lower() for w in ("pulse", "animation", "animate", "rhythm", "beat", "moving", "dynamic")):
+                nanoleaf_scene = self._pick_nanoleaf_scene(description, scenes)
+            nanoleaf_style = self._pick_nanoleaf_style(description) if not nanoleaf_scene else None
+            if not govee_style and not nanoleaf_scene and not nanoleaf_style:
+                return self._call_model(
+                    user_text,
+                    None,
+                    extra_note="System note: The app could not pick a custom look for the lights. Ask the user to try again or describe the look they want.\n\n",
+                )
+            parts = []
+            if govee_style:
+                try:
+                    set_lights_style(state="on", **govee_style)
+                    self.log("Govee set to custom color/brightness.")
+                    parts.append("Govee lights set to a static color and brightness (Govee cannot do pulse or animation).")
+                except LightsClientError as e:
+                    self.log(f"Govee custom failed: {e}")
+                    parts.append("Govee lights could not be updated.")
+            if nanoleaf_scene:
+                try:
+                    nanoleaf.turn_on()
+                    nanoleaf.set_effect(nanoleaf_scene)
+                    self.log(f"Nanoleaf set to scene {nanoleaf_scene!r} (animated).")
+                    parts.append(f"Nanoleaf panels set to the \"{nanoleaf_scene}\" scene (animated/pulse).")
+                except Exception as e:
+                    self.log(f"Nanoleaf set_effect failed: {e}")
+                    parts.append("Nanoleaf panels could not be updated.")
+            elif nanoleaf_style:
+                try:
+                    nanoleaf.turn_on()
+                    if nanoleaf_style.get("color_hex"):
+                        h = nanoleaf_style["color_hex"]
+                        r, g, b = int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+                        nanoleaf.set_color_rgb(r, g, b)
+                    if nanoleaf_style.get("brightness") is not None:
+                        nanoleaf.set_brightness(nanoleaf_style["brightness"])
+                    self.log("Nanoleaf set to custom color/brightness.")
+                    parts.append("Nanoleaf panels set to a custom color and brightness (static).")
+                except Exception as e:
+                    self.log(f"Nanoleaf custom failed: {e}")
+                    parts.append("Nanoleaf panels could not be updated.")
+            note = " ".join(parts)
+            return self._call_model(
+                user_text,
+                None,
+                extra_note="System note: " + note + "\n\n",
+            )
+
+        if action == "nanoleaf.create_animation":
+            anim_type = str(params.get("animation_type") or "flow").strip().lower()
+            raw_colors = params.get("colors")
+            if isinstance(raw_colors, list) and len(raw_colors) >= 2:
+                colors_rgb = []
+                for c in raw_colors:
+                    s = str(c).strip()
+                    if s.startswith("#") and len(s) >= 7:
+                        try:
+                            r = int(s[1:3], 16)
+                            g = int(s[3:5], 16)
+                            b = int(s[5:7], 16)
+                            colors_rgb.append((r, g, b))
+                        except ValueError:
+                            pass
+                if len(colors_rgb) >= 2:
+                    speed = params.get("speed")
+                    try:
+                        speed = float(speed) if speed is not None else 1.0
+                    except (TypeError, ValueError):
+                        speed = 1.0
+                    speed = max(0.5, min(5.0, round(speed, 1)))
+                    try:
+                        ok = nanoleaf.create_flow_effect(colors_rgb, speed)
+                        if ok:
+                            self.log("Nanoleaf create_flow_effect succeeded.")
+                            # If user asked to "make the lights" a color, set Govee to that color too
+                            first_hex = raw_colors[0] if raw_colors else None
+                            if first_hex:
+                                try:
+                                    set_lights_style(state="on", color_hex=first_hex, brightness=75)
+                                    self.log("Govee set to match animation color.")
+                                except LightsClientError:
+                                    pass
+                            return self._call_model(
+                                user_text,
+                                None,
+                                extra_note="System note: A new flowing animation was created on the Nanoleaf panels with the chosen colors and speed."
+                                + (" Govee lights were also set to match." if first_hex else "") + "\n\n",
+                            )
+                    except Exception as e:
+                        self.log(f"nanoleaf.create_animation failed: {e}")
+            return self._call_model(
+                user_text,
+                None,
+                extra_note="System note: Could not create the animation (need at least 2 valid hex colors in params.colors, e.g. [\"#FF0000\", \"#0000FF\"]).\n\n",
+            )
 
         if action == "plex_sync.run":
             self.log("Plex sync started in the background.")

@@ -13,6 +13,7 @@ from lights_client import (
     set_lights_auto,
 )
 from gmail_client import search_gmail, GmailClientError
+from assistant_engine import AssistantEngine
 
 # Plex sync app: run script in background and notify when done
 PLEX_SYNC_DIR = r"H:\Coding\Python Projects\plex_sync"
@@ -50,6 +51,8 @@ class ChatApp:
         # simple conversational state for routing and context
         self.last_route: dict | None = None
         self.last_user_message: str | None = None
+        # Use shared assistant engine for routing + tools (lights.set_scene, Nanoleaf, Gmail, etc.)
+        self._assistant_engine = AssistantEngine(log_fn=self._log_event)
 
         self._configure_root()
         self._build_layout()
@@ -811,102 +814,15 @@ Previous routed action (JSON or null):
         ).start()
 
     def _handle_user_message(self, user_text: str) -> None:
-        """Route the user's message through the LLM router, then execute tools/chat."""
-        route = self._route_command(user_text)
-        action = (route.get("action") or "none").lower()
-        params = route.get("params") or {}
-        self.last_route = route
-
-        if action == "lights.set_state":
-            state = str(params.get("state", "")).lower()
-            if state in ("on", "off", "auto"):
-                self._log_event(f"Turning lights {state}.")
-                if state == "auto":
-                    self._set_living_room_auto()
-                else:
-                    self._set_living_room_state(state)
-                # Let the model give a natural-language confirmation
-                self.call_model_and_display(user_text, state)
-            else:
-                self._log_event(f"Router gave invalid light state: {state!r}")
-                self.call_model_and_display(user_text, None)
-
-        elif action == "lights.get_state":
-            try:
-                result = get_lights_state()
-                light_state = result.get("state", "unknown")
-                msg = f"The lights are {light_state}."
-                self._log_event(msg)
-                self.call_model_and_display(
-                    user_text,
-                    None,
-                    extra_note=f"System note: The app just checked the lights; they are {light_state}.\n\n",
-                )
-            except LightsClientError as e:
-                self._log_event(f"Lights state check failed: {e}")
-                self.call_model_and_display(
-                    user_text,
-                    None,
-                    extra_note="System note: The app tried to check the lights but the request failed (e.g. endpoint not found or server error). Do NOT guess whether the lights are on or off; tell the user the check failed and they can try again or check manually.\n\n",
-                )
-
-        elif action == "gmail.search":
-            # Use the LLM-interpreted search query; sanitize to drop any operator-like tokens
-            raw_query = str(params.get("query") or user_text).strip()
-            query = " ".join(w for w in raw_query.split() if ":" not in w) or raw_query
-
-            # Start from the router's suggested scope, but then correct it using
-            # simple heuristics so obviously "historical" questions don't get
-            # restricted to only UNREAD mail.
-            scope = str(params.get("scope") or "unread").lower()
-            text_lower = user_text.lower()
-
-            # If the user explicitly says "unread", prefer UNREAD.
-            if "unread" in text_lower:
-                scope = "unread"
-            # If they talk about the "last", "latest", or "most recent" email
-            # without saying "unread", they almost certainly mean any email,
-            # whether read or unread, so search ALL.
-            elif any(w in text_lower for w in (" last ", " latest", "most recent")):
-                scope = "all"
-
-            if scope not in ("unread", "all"):
-                scope = "unread"
-            result_type = str(params.get("result_type") or "list").lower()
-            if result_type not in ("count", "list"):
-                result_type = "list"
-
-            category = params.get("category")
-            if isinstance(category, str):
-                category = category.lower()
-                if category not in ("updates", "primary", "promotions", "social", "forums"):
-                    category = None
-            else:
-                category = None
-
-            # Perform Gmail search; for list type we may use broad terms + LLM interpretation
-            broad_terms = params.get("broad_search_terms")
-            if isinstance(broad_terms, list) and result_type == "list":
-                broad_terms = [str(t).strip() for t in broad_terms if t and ":" not in str(t)][:8]
-            else:
-                broad_terms = None
-            self._search_gmail_worker(query, scope, result_type, category, user_text, broad_terms)
-            # Optionally, we could call the model here with the concrete results
-            # to generate a more conversational reply. For now, the System summary
-            # is the source of truth.
-
-        elif action == "plex_sync.run":
-            self._log_event("Plex sync started in the background.")
-            threading.Thread(target=self._run_plex_sync_worker, daemon=True).start()
-            self.call_model_and_display(
-                user_text,
-                None,
-                extra_note="System note: The app has just started the Plex sync in the background and will notify when it finishes.\n\n",
-            )
-
-        else:
-            # No tools; just regular chat
-            self.call_model_and_display(user_text, None)
+        """Run routing and tools in the shared assistant engine, then display the reply."""
+        try:
+            reply = self._assistant_engine.handle_message(user_text)
+        except Exception as e:
+            reply = f"Error: {e}"
+            self._log_event(str(e))
+        self.last_route = self._assistant_engine.last_route
+        self.last_user_message = user_text
+        self.root.after(0, lambda: self.append_message("Assistant", reply))
 
     def call_model_and_display(
         self,

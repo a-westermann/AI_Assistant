@@ -1,10 +1,11 @@
 """
 FastAPI server for Galadrial: POST /chat with a message, get the assistant reply.
 Run with: uvicorn api_server:app --host 0.0.0.0 --port 8000
-Then open http://<this-pc-ip>:8000/ in a browser (e.g. from Android via Tailscale).
+Then open http://<this-pc-ip>:8000/ in a browser from this PC or another device on the same LAN.
 """
 
 import logging
+import socket
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -28,9 +29,32 @@ def _log_event(msg: str) -> None:
     logger.info(msg)
 
 
+def _lan_ips() -> list[str]:
+    """Return this machine's LAN IPv4 addresses (excluding localhost)."""
+    ips = []
+    try:
+        # Connect to an external address to see which interface is used; doesn't send data
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ips.append(s.getsockname()[0])
+    except Exception:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip != "127.0.0.1" and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips or ["<get your PC IP from ipconfig>"]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Galadrial API server started. POST /chat with {\"message\": \"...\"}")
+    port = 8000
+    for ip in _lan_ips():
+        logger.info("LAN URL: http://%s:%s/ (use this from phone/other devices on same WiFi)", ip, port)
     yield
     logger.info("Shutting down.")
 
