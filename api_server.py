@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from assistant_engine import handle_message
+from pomodoro import get_timer as get_pomodoro_timer
 from dnd_loader import (
     build_context_from_llm_selection,
     get_selection_catalog,
@@ -145,6 +146,41 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/pomodoro", response_class=HTMLResponse)
+@app.get("/pomodoro/", response_class=HTMLResponse)
+async def pomodoro_page():
+    """Serve the pomodoro focus timer web UI."""
+    return get_pomodoro_html()
+
+
+@app.get("/pomodoro/status")
+async def pomodoro_status():
+    """Return current pomodoro timer state for polling."""
+    timer = get_pomodoro_timer(log_fn=_log_event)
+    return timer.get_status()
+
+
+@app.post("/pomodoro/start")
+async def pomodoro_start():
+    """Start a focus session."""
+    timer = get_pomodoro_timer(log_fn=_log_event)
+    return timer.start_focus()
+
+
+@app.post("/pomodoro/stop")
+async def pomodoro_stop():
+    """Stop the pomodoro timer."""
+    timer = get_pomodoro_timer(log_fn=_log_event)
+    return timer.stop()
+
+
+@app.post("/pomodoro/skip")
+async def pomodoro_skip():
+    """Skip to the next phase."""
+    timer = get_pomodoro_timer(log_fn=_log_event)
+    return timer.skip()
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest):
     """Send a message, get the assistant's reply. Runs routing + tools + LLM on this PC."""
@@ -274,7 +310,10 @@ def get_client_html() -> str:
 
 def get_dnd_html() -> str:
     """D&D improv page: Record/Stop (Web Speech API), transcript area, Send -> suggested dialogue."""
-    return """<!DOCTYPE html>
+    return _DND_HTML
+
+
+_DND_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -412,6 +451,438 @@ def get_dnd_html() -> str:
         sendBtn.disabled = false;
       }
     });
+  </script>
+</body>
+</html>
+"""
+
+
+def get_pomodoro_html() -> str:
+    """Pomodoro focus timer page with celestial elvish aesthetic."""
+    return _POMODORO_HTML
+
+
+_POMODORO_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Focus Timer - Galadrial</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600&family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --phase-primary: #9a9fb2;
+      --phase-glow: rgba(154, 159, 178, 0.2);
+      --phase-glow-strong: rgba(154, 159, 178, 0.35);
+      --phase-bg-glow: rgba(154, 159, 178, 0.04);
+      --bg-deep: #0b0d10;
+      --bg-surface: #11141a;
+      --border-dim: #1a1e28;
+      --text-primary: #f7f7f7;
+      --text-muted: #6b7084;
+      --text-secondary: #9a9fb2;
+      --ring-size: min(300px, 72vw);
+      --transition-speed: 0.8s;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      background: var(--bg-deep);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      overflow-x: hidden;
+      position: relative;
+    }
+
+    body::before {
+      content: '';
+      position: fixed;
+      top: 30%;
+      left: 50%;
+      width: 600px;
+      height: 600px;
+      transform: translate(-50%, -50%);
+      background: radial-gradient(circle, var(--phase-bg-glow) 0%, transparent 70%);
+      pointer-events: none;
+      transition: background var(--transition-speed) ease;
+      z-index: 0;
+    }
+
+    .particles {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      z-index: 0;
+      overflow: hidden;
+    }
+
+    .particle {
+      position: absolute;
+      width: 3px; height: 3px;
+      border-radius: 50%;
+      background: var(--phase-primary);
+      opacity: 0;
+      animation: drift linear infinite;
+    }
+
+    @keyframes drift {
+      0%   { opacity: 0; transform: translateY(100vh) translateX(0px); }
+      10%  { opacity: 0.4; }
+      90%  { opacity: 0.15; }
+      100% { opacity: 0; transform: translateY(-20vh) translateX(var(--sway)); }
+    }
+
+    .container {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 2rem 1rem;
+      gap: 2rem;
+    }
+
+    .brand {
+      font-family: 'Cinzel', serif;
+      font-size: 0.85rem;
+      font-weight: 500;
+      letter-spacing: 0.35em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: -0.5rem;
+    }
+
+    .timer-wrap {
+      position: relative;
+      width: var(--ring-size);
+      height: var(--ring-size);
+    }
+
+    .timer-svg {
+      width: 100%; height: 100%;
+      transform: rotate(-90deg);
+      filter: drop-shadow(0 0 18px var(--phase-glow));
+      transition: filter var(--transition-speed) ease;
+    }
+
+    .ring-bg {
+      fill: none;
+      stroke: var(--border-dim);
+      stroke-width: 3;
+    }
+
+    .ring-progress {
+      fill: none;
+      stroke: var(--phase-primary);
+      stroke-width: 4;
+      stroke-linecap: round;
+      transition: stroke var(--transition-speed) ease, stroke-dashoffset 0.3s linear;
+    }
+
+    .ring-inner {
+      fill: none;
+      stroke: var(--phase-primary);
+      stroke-width: 0.5;
+      opacity: 0.2;
+      transition: stroke var(--transition-speed) ease;
+    }
+
+    .timer-content {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+    }
+
+    .phase-label {
+      font-family: 'Cinzel', serif;
+      font-size: 0.75rem;
+      font-weight: 500;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--phase-primary);
+      transition: color var(--transition-speed) ease;
+    }
+
+    .time-display {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: clamp(2.4rem, 8vw, 3.4rem);
+      font-weight: 300;
+      letter-spacing: 0.05em;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-primary);
+      text-shadow: 0 0 30px var(--phase-glow);
+      transition: text-shadow var(--transition-speed) ease;
+      line-height: 1;
+    }
+
+    .phase-sub {
+      font-family: 'Cormorant Garamond', serif;
+      font-size: 0.95rem;
+      font-style: italic;
+      color: var(--text-muted);
+      margin-top: 0.2rem;
+    }
+
+    .sessions {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    .dots {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      border: 1.5px solid var(--phase-primary);
+      background: transparent;
+      transition: all var(--transition-speed) ease;
+    }
+
+    .dot.filled {
+      background: var(--phase-primary);
+      box-shadow: 0 0 8px var(--phase-glow);
+    }
+
+    .session-count {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      letter-spacing: 0.05em;
+    }
+
+    .controls {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .btn {
+      font-family: 'Cinzel', serif;
+      font-size: 0.8rem;
+      font-weight: 500;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      padding: 0.7rem 1.6rem;
+      border-radius: 100px;
+      border: 1px solid var(--phase-primary);
+      background: transparent;
+      color: var(--phase-primary);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      outline: none;
+    }
+
+    .btn:hover {
+      background: var(--phase-glow);
+      box-shadow: 0 0 20px var(--phase-glow);
+    }
+
+    .btn:active { transform: scale(0.97); }
+
+    .btn.primary {
+      background: var(--phase-primary);
+      color: var(--bg-deep);
+    }
+
+    .btn.primary:hover {
+      box-shadow: 0 0 25px var(--phase-glow-strong);
+    }
+
+    .btn:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    .btn:disabled:hover {
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .btn.primary:disabled { opacity: 0.5; }
+
+    .btn.primary:disabled:hover {
+      background: var(--phase-primary);
+      box-shadow: none;
+    }
+
+    [data-phase="focus"] {
+      --phase-primary: #4488FF;
+      --phase-glow: rgba(68, 136, 255, 0.25);
+      --phase-glow-strong: rgba(68, 136, 255, 0.4);
+      --phase-bg-glow: rgba(68, 136, 255, 0.05);
+    }
+
+    [data-phase="short_break"] {
+      --phase-primary: #F0B34A;
+      --phase-glow: rgba(240, 179, 74, 0.25);
+      --phase-glow-strong: rgba(240, 179, 74, 0.4);
+      --phase-bg-glow: rgba(240, 179, 74, 0.05);
+    }
+
+    [data-phase="long_break"] {
+      --phase-primary: #44BB88;
+      --phase-glow: rgba(68, 187, 136, 0.25);
+      --phase-glow-strong: rgba(68, 187, 136, 0.4);
+      --phase-bg-glow: rgba(68, 187, 136, 0.05);
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .container > * { animation: fadeUp 0.6s ease both; }
+    .container > :nth-child(1) { animation-delay: 0.05s; }
+    .container > :nth-child(2) { animation-delay: 0.15s; }
+    .container > :nth-child(3) { animation-delay: 0.25s; }
+    .container > :nth-child(4) { animation-delay: 0.35s; }
+
+    @media (max-width: 400px) {
+      .btn { padding: 0.6rem 1.2rem; font-size: 0.7rem; }
+      .brand { font-size: 0.75rem; }
+    }
+  </style>
+</head>
+<body data-phase="idle">
+  <div class="particles" id="particles"></div>
+  <div class="container">
+    <div class="brand">Galadrial</div>
+    <div class="timer-wrap">
+      <svg class="timer-svg" viewBox="0 0 200 200">
+        <circle class="ring-inner" cx="100" cy="100" r="78" />
+        <circle class="ring-bg" cx="100" cy="100" r="88" />
+        <circle class="ring-progress" id="ringProgress" cx="100" cy="100" r="88"
+          stroke-dasharray="553" stroke-dashoffset="0" />
+      </svg>
+      <div class="timer-content">
+        <div class="phase-label" id="phaseLabel">Ready</div>
+        <div class="time-display" id="timeDisplay">25:00</div>
+        <div class="phase-sub" id="phaseSub">Start when you are</div>
+      </div>
+    </div>
+    <div class="sessions">
+      <div class="dots" id="dots">
+        <div class="dot"></div><div class="dot"></div>
+        <div class="dot"></div><div class="dot"></div>
+      </div>
+      <div class="session-count" id="sessionCount">0 completed today</div>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="startBtn" onclick="doStart()">Begin</button>
+      <button class="btn" id="skipBtn" onclick="doSkip()" disabled>Skip</button>
+      <button class="btn" id="stopBtn" onclick="doStop()" disabled>Stop</button>
+    </div>
+  </div>
+  <script>
+    const CIRCUMFERENCE = 2 * Math.PI * 88;
+    const ringEl       = document.getElementById('ringProgress');
+    const phaseLabel   = document.getElementById('phaseLabel');
+    const timeDisplay  = document.getElementById('timeDisplay');
+    const phaseSub     = document.getElementById('phaseSub');
+    const sessionCount = document.getElementById('sessionCount');
+    const dotsEl       = document.getElementById('dots');
+    const startBtn     = document.getElementById('startBtn');
+    const skipBtn      = document.getElementById('skipBtn');
+    const stopBtn      = document.getElementById('stopBtn');
+
+    const PHASE_LABELS = { idle:'Ready', focus:'Focus', short_break:'Rest', long_break:'Recharge' };
+    const PHASE_SUBS   = { idle:'Start when you are', focus:'Deep work', short_break:'Breathe', long_break:'You have earned this' };
+
+    let currentPhase = 'idle';
+
+    function fmt(s) {
+      return String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
+    }
+
+    function updateUI(d) {
+      const phase     = d.state || 'idle';
+      const completed = d.completed_today || 0;
+      const remaining = d.remaining_seconds || 0;
+      const duration  = d.phase_duration_seconds || 1;
+
+      if (phase !== currentPhase) {
+        currentPhase = phase;
+        document.body.setAttribute('data-phase', phase);
+      }
+
+      phaseLabel.textContent = PHASE_LABELS[phase] || phase;
+      phaseSub.textContent   = PHASE_SUBS[phase] || '';
+
+      if (phase === 'idle') {
+        timeDisplay.textContent = '25:00';
+        ringEl.style.strokeDashoffset = '0';
+      } else {
+        timeDisplay.textContent = fmt(remaining);
+        ringEl.style.strokeDashoffset = String((1 - remaining/duration) * CIRCUMFERENCE);
+      }
+
+      const inSet = completed % 4;
+      dotsEl.querySelectorAll('.dot').forEach((dot, i) => {
+        dot.classList.toggle('filled', i < inSet);
+      });
+      sessionCount.textContent = completed + ' completed today';
+
+      const idle = phase === 'idle';
+      startBtn.disabled    = !idle;
+      startBtn.textContent = idle ? 'Begin' : (phase === 'focus' ? 'Focusing' : 'Resting');
+      startBtn.classList.toggle('primary', idle);
+      skipBtn.disabled = idle;
+      stopBtn.disabled = idle;
+    }
+
+    async function api(path) {
+      try { const r = await fetch(path, {method:'POST'}); return await r.json(); }
+      catch(e) { console.error(e); return null; }
+    }
+
+    async function poll() {
+      try { const r = await fetch('/pomodoro/status'); updateUI(await r.json()); }
+      catch(e) { console.error(e); }
+    }
+
+    async function doStart() { startBtn.disabled=true; const d=await api('/pomodoro/start'); if(d) updateUI(d); }
+    async function doStop()  { stopBtn.disabled=true;  const d=await api('/pomodoro/stop');  if(d) updateUI(d); }
+    async function doSkip()  { skipBtn.disabled=true;  const d=await api('/pomodoro/skip');  if(d) updateUI(d); }
+
+    function createParticles() {
+      const c = document.getElementById('particles');
+      for (let i = 0; i < 14; i++) {
+        const p = document.createElement('div');
+        p.className = 'particle';
+        p.style.left = (Math.random()*100)+'%';
+        const sz = (2+Math.random()*2)+'px';
+        p.style.width = sz; p.style.height = sz;
+        p.style.setProperty('--sway', (Math.random()*60-30)+'px');
+        p.style.animationDuration = (18+Math.random()*20)+'s';
+        p.style.animationDelay = (Math.random()*20)+'s';
+        c.appendChild(p);
+      }
+    }
+
+    createParticles();
+    poll();
+    setInterval(poll, 1000);
   </script>
 </body>
 </html>

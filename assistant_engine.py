@@ -19,6 +19,7 @@ from lights_client import (
 )
 from nanoleaf import nanoleaf
 from gmail_client import search_gmail, GmailClientError
+from pomodoro import get_timer as get_pomodoro_timer
 
 # Plex sync (same as chat_gui; override with PLEX_SYNC_DIR env if needed)
 PLEX_SYNC_DIR = os.environ.get("PLEX_SYNC_DIR", r"H:\Coding\Python Projects\plex_sync")
@@ -84,6 +85,26 @@ TOOLS = [
             {"name": "colors", "type": "array", "description": "List of hex color strings, e.g. [\"#FF0000\", \"#00FF00\", \"#0000FF\"]. Need at least 2 for flow."},
             {"name": "speed", "type": "number", "description": "Optional. Transition speed 0.5–5 (seconds). Default 1."},
         ],
+    },
+    {
+        "name": "pomodoro.start",
+        "description": "Start a pomodoro focus session (25 min work, then automatic break). Lights shift to a cool, bright focus setting. Use when the user says: start a focus session, start pomodoro, let's focus, time to work, begin a pomodoro, focus mode.",
+        "params": [],
+    },
+    {
+        "name": "pomodoro.stop",
+        "description": "Stop the current pomodoro timer and return to idle. Use when the user says: stop the timer, cancel pomodoro, end the session, I'm done focusing.",
+        "params": [],
+    },
+    {
+        "name": "pomodoro.skip",
+        "description": "Skip the current pomodoro phase (jump from focus to break or break to focus). Use when the user says: skip, next phase, skip the break, skip to break, move on.",
+        "params": [],
+    },
+    {
+        "name": "pomodoro.status",
+        "description": "Check the current pomodoro timer status: what phase, time remaining, how many completed today. Use when the user asks: how many pomodoros today, what's the timer at, am I on a break, pomodoro stats, how much time left, timer status.",
+        "params": [],
     },
 ]
 
@@ -280,6 +301,10 @@ Interpret intent from the actual request. Examples:
 - "are the lights on?" → lights.get_state
 - "run Plex sync" → plex_sync.run
 - "check my email for X" → gmail.search with query/scope/result_type
+- "start a focus session" / "pomodoro" / "time to work" / "focus mode" → pomodoro.start
+- "stop the timer" / "cancel the pomodoro" / "I'm done" → pomodoro.stop
+- "skip" / "skip the break" / "next phase" → pomodoro.skip
+- "how many pomodoros today?" / "timer status" / "how much time left" → pomodoro.status
 
 If the user said "again" or "same thing", repeat the previous action. Do not choose "none" when the user is asking you to change the lights or set a mood—use lights.set_scene or nanoleaf.set_scene as appropriate. If they ask to "create a new animation" or "create an animation for the lights", always use nanoleaf.create_animation with colors (and optional speed)—never respond with a list of settings for them to enter in an app.
 
@@ -343,6 +368,10 @@ Respond with JSON only:
             "making something up.\n"
             "- You may still answer general questions with your own knowledge, but "
             "never fabricate concrete details about my life or accounts.\n\n"
+            "- The app has a pomodoro focus timer that integrates with the lights. "
+            "When a pomodoro starts, lights shift to a cool focus setting; on breaks, "
+            "they shift to warm relaxation. Give brief, contextual encouragement: "
+            "motivational at the start, congratulatory on completion, gentle during breaks.\n"
             "- The user has a D&D campaign folder (notes and maps). You do not have access to it "
             "from this chat. If they ask, say that the D&D improv feature does: when they open "
             "http://localhost:8000/dnd in a browser (with the API server running), they can "
@@ -950,6 +979,72 @@ Respond with JSON only:
                 None,
                 extra_note="System note: The app has just started the Plex sync in the background and will notify when it finishes.\n\n",
             )
+
+        if action == "pomodoro.start":
+            timer = get_pomodoro_timer(log_fn=self.log)
+            result = timer.start_focus()
+            completed = result.get("completed_today", 0)
+            duration = result.get("phase_duration_seconds", 1500) // 60
+            return self._call_model(
+                user_text,
+                None,
+                extra_note=(
+                    f"System note: A {duration}-minute focus session has started. "
+                    f"Lights are set to a cool, bright focus setting. "
+                    f"Completed pomodoros today: {completed}. "
+                    "Give the user a brief, motivational message to start their focus session.\n\n"
+                ),
+            )
+
+        if action == "pomodoro.stop":
+            timer = get_pomodoro_timer(log_fn=self.log)
+            result = timer.stop()
+            completed = result.get("completed_today", 0)
+            return self._call_model(
+                user_text,
+                None,
+                extra_note=(
+                    f"System note: The pomodoro timer has been stopped. "
+                    f"Total completed pomodoros today: {completed}. "
+                    "Acknowledge the stop and mention their progress.\n\n"
+                ),
+            )
+
+        if action == "pomodoro.skip":
+            timer = get_pomodoro_timer(log_fn=self.log)
+            result = timer.skip()
+            new_state = result.get("state", "idle")
+            remaining = result.get("remaining_seconds", 0)
+            return self._call_model(
+                user_text,
+                None,
+                extra_note=(
+                    f"System note: Skipped to the next phase. Now in '{new_state}' "
+                    f"with {remaining // 60} minutes remaining. "
+                    "Briefly tell the user what phase they are now in.\n\n"
+                ),
+            )
+
+        if action == "pomodoro.status":
+            timer = get_pomodoro_timer(log_fn=self.log)
+            result = timer.get_status()
+            state = result.get("state", "idle")
+            completed = result.get("completed_today", 0)
+            remaining = result.get("remaining_seconds", 0)
+            if state == "idle":
+                extra = (
+                    f"System note: No pomodoro is running. "
+                    f"Completed today: {completed}. "
+                    "Tell the user their stats and offer to start a new session.\n\n"
+                )
+            else:
+                extra = (
+                    f"System note: Pomodoro is in '{state}' phase. "
+                    f"{remaining // 60}m {remaining % 60}s remaining. "
+                    f"Completed today: {completed}. "
+                    "Summarize the status concisely.\n\n"
+                )
+            return self._call_model(user_text, None, extra_note=extra)
 
         return self._call_model(user_text, None)
 
