@@ -19,7 +19,7 @@ from dnd_loader import (
     load_images_as_data_urls,
     _parse_llm_selection_response,
 )
-from test import ask_lmstudio, ask_lmstudio_with_images
+from llm import ask_lmstudio, ask_lmstudio_with_images
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

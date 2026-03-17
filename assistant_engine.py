@@ -10,7 +10,7 @@ import subprocess
 import threading
 from typing import Any, Callable, Optional
 
-from test import ask_lmstudio
+from llm import ask_lmstudio
 from lights_client import (
     get_lights_state,
     toggle_all_lights,
@@ -21,6 +21,7 @@ from lights_client import (
 from nanoleaf import nanoleaf
 from gmail_client import search_gmail, GmailClientError
 from user_memory import remember_alias, resolve_alias
+from weather_client import get_current_weather_summary, WeatherClientError
 
 # Plex sync (same as chat_gui; override with PLEX_SYNC_DIR env if needed)
 PLEX_SYNC_DIR = os.environ.get("PLEX_SYNC_DIR", r"H:\Coding\Python Projects\plex_sync")
@@ -146,7 +147,24 @@ class AssistantEngine:
 
     def _is_lighting_related(self, text: str) -> bool:
         t = (text or "").lower()
-        return any(w in t for w in ("light", "lights", "nanoleaf", "govee", "scene", "brightness", "dim", "bright"))
+        # Treat good morning / good night as lighting routines
+        if "good morning" in t or "good night" in t:
+            return True
+        return any(
+            w in t
+            for w in (
+                "light",
+                "lights",
+                "nanoleaf",
+                "govee",
+                "scene",
+                "brightness",
+                "dim",
+                "bright",
+                "cozy",
+                "warm",
+            )
+        )
 
     def _parse_lighting_plan(self, user_text: str, scene_list: list[str]) -> dict | None:
         """
@@ -501,17 +519,17 @@ Reply with JSON only (no markdown)."""
         # If user wants to change animation speed and we have a previous create_animation, reuse it with new speed so we actually apply
         speed_route = self._route_speed_adjust(user_text)
         if speed_route is not None:
-            self.log(f"Router decided action (speed adjust): {speed_route}")
+            self.log("Router: using speed-adjust heuristic for nanoleaf animation.")
             return speed_route
         # "turn the nanoleaf off" / "nanoleaf on" → only Nanoleaf power, no Govee
         nanoleaf_power_route = self._route_nanoleaf_power(user_text)
         if nanoleaf_power_route is not None:
-            self.log(f"Router decided action (nanoleaf power): {nanoleaf_power_route}")
+            self.log("Router: using nanoleaf power heuristic (on/off only).")
             return nanoleaf_power_route
         # "make the nanoleaf lights dimmer" / "nanoleaf brighter" → only Nanoleaf brightness, no scene or Govee
         nanoleaf_bright_route = self._route_nanoleaf_brightness(user_text)
         if nanoleaf_bright_route is not None:
-            self.log(f"Router decided action (nanoleaf brightness only): {nanoleaf_bright_route}")
+            self.log("Router: using nanoleaf brightness heuristic.")
             return nanoleaf_bright_route
         tools_blob = _format_tools_for_prompt()
 
@@ -559,14 +577,12 @@ Respond with JSON only:
             params = route.get("params") if isinstance(route.get("params"), dict) else {}
             cleaned = {"action": action, "params": params}
             if action not in VALID_ACTIONS:
-                self.log(f"Model returned unknown action {action!r}; using fallback.")
+                self.log("Router: model returned unknown action; using fallback.")
                 cleaned = self._heuristic_route(user_text)
-            self.log(f"Router decided action: {cleaned}")
             return cleaned
         except Exception as e:
-            self.log(f"Tool choice failed ({e}); using fallback.")
+            self.log(f"Router error in tool choice; using fallback. Details: {e}")
             cleaned = self._heuristic_route(user_text)
-            self.log(f"Router decided action: {cleaned}")
             return cleaned
 
     def _heuristic_route(self, user_text: str) -> dict:
@@ -582,26 +598,29 @@ Respond with JSON only:
         """Build prompt, call LM Studio, return assistant reply text."""
         system_preamble = (
             "You are Galadrial, an AI assistant embedded in a desktop GUI.\n\n"
-            "- The app can control my Govee lights via an API. When you see a "
-            "system note telling you that the lights were set to a state, you may "
-            "speak as if that action has already been performed.\n"
-            "- The app may also display separate System messages with the results "
-            "of tools (for example, Gmail searches, Plex sync). Those System messages are the "
-            "source of truth about my real data.\n\n"
+            "- Your user's name is Andrew. Give short, concise responses."
+            " Always be warm and friendly.\n"
+            "- The app can control my Govee lights via an API. When you see a system note telling"
+            " you that the lights were set to a state, you may speak as if that action has already"
+            " been performed.\n"
+            "- The app may also display separate System messages with the results of tools"
+            " (for example, Gmail searches, Plex sync, weather). Those System messages are the"
+            " source of truth about my real data.\n"
+            "- VERY IMPORTANT: Do NOT repeat System notes verbatim or list them like logs"
+            " (e.g. 'Lights set:', 'Weather:', 'Quick news summary:'). Instead"
+            " briefly and naturally incorporate only the important parts"
+            " into your reply, or skip details I didn't explicitly ask for.\n\n"
             "CRITICAL SAFETY RULES:\n"
-            "- Do NOT invent or guess specific facts about my personal data, such "
-            "as emails, literary magazine acceptances, bank balances, calendar "
-            "events, or file contents.\n"
-            "- If you are not given an explicit System note or tool result that "
-            "contains those facts, you must say that you don't know instead of "
-            "making something up.\n"
-            "- You may still answer general questions with your own knowledge, but "
-            "never fabricate concrete details about my life or accounts.\n\n"
-            "- The user has a D&D campaign folder (notes and maps). You do not have access to it "
-            "from this chat. If they ask, say that the D&D improv feature does: when they open "
-            "http://localhost:8000/dnd in a browser (with the API server running), they can "
-            "record or paste conversation and click Get suggestion to get dialogue that uses "
-            "that folder.\n\n"
+            "- Do NOT invent or guess specific facts about my personal data or file contents.\n"
+            "- If you are not given an explicit System note or tool result that contains those"
+            " facts, you must say that you don't know instead of making something up.\n"
+            "- You may still answer general questions with your own knowledge, but never fabricate"
+            " concrete details about my life or accounts.\n\n"
+            "- The user has a D&D campaign folder (notes and maps). You do not have access to it"
+            " from this chat. If they ask, say that the D&D improv feature does: when they open"
+            " http://localhost:8000/dnd in a browser (with the API server running), they can"
+            " record or paste conversation and click Get suggestion to get dialogue that uses"
+            " that folder.\n\n"
         )
         action_note = ""
         if light_action in ("on", "off", "auto"):
@@ -631,7 +650,7 @@ Respond with JSON only:
                 )
                 return (response.get("output") or [{}])[0].get("content", "").strip() or None
             except Exception as e:
-                self.log(f"Interpretation (no results) failed: {e}")
+                self.log(f"Email interpretation (no results) failed: {e}")
                 return None
         lines = []
         for i, m in enumerate(messages, 1):
@@ -664,7 +683,7 @@ Respond with JSON only:
             text = (response.get("output") or [{}])[0].get("content", "").strip()
             return text or None
         except Exception as e:
-            self.log(f"Interpretation failed: {e}")
+            self.log(f"Email interpretation failed: {e}")
             return None
 
     def _search_gmail_sync(
@@ -685,8 +704,7 @@ Respond with JSON only:
                 narrow_terms = list(broad_search_terms)
             search_query = " OR ".join(narrow_terms)
             max_results = 80
-            self.log(f"Searching Gmail with broad terms (OR): {search_query!r}")
-        self.log(f"Searching Gmail (scope={scope}, result={result_type}) for: {search_query!r}")
+        self.log(f"Gmail search started (scope={scope}, result={result_type}).")
         count_only = result_type == "count"
         try:
             messages = search_gmail(
@@ -905,10 +923,72 @@ Respond with JSON only:
         except Exception as e:
             self.log(f"Plex sync error: {e}")
 
+    def _run_morning_routine(self, user_text: str) -> str:
+        """Good morning: lights on at brightness 35, color to #FFB266 + brief weather + greeting."""
+        # Lights: warm, gentle morning color on both systems.
+        try:
+            # Govee: warm white, 35% brightness.
+            set_lights_style(state="on", color_hex=None, color_temp_k=2700, brightness=35)
+        except LightsClientError as e:
+            self.log(f"Govee morning routine failed: {e}")
+        try:
+            # Nanoleaf: warm orange, 35% brightness.
+            nanoleaf.turn_on()
+            # Approximate warm orange.
+            nanoleaf.set_color_rgb(255, 180, 120)
+            nanoleaf.set_brightness(35)
+        except Exception as e:
+            self.log(f"Nanoleaf morning routine failed: {e}")
+
+        # Weather briefing if available.
+        extra = ""
+        try:
+            weather = get_current_weather_summary()
+            extra = (
+                "System note: The app has already prepared the morning environment."
+                " Briefly greet Andrew with 'Good morning, Andrew.' and naturally mention"
+                f" the current weather: {weather}. Do NOT mention the lights at all, and"
+                " do NOT repeat this note verbatim.\n\n"
+            )
+        except WeatherClientError as e:
+            self.log(f"Weather fetch failed in morning routine: {e}")
+            extra = (
+                "System note: The app has already prepared the morning environment."
+                " Briefly greet Andrew with 'Good morning, Andrew.' You do not know"
+                " the current weather. Do NOT mention the lights, and do NOT repeat"
+                " this note verbatim.\n\n"
+            )
+        self.log("Morning routine executed.")
+        return self._call_model(user_text, None, extra_note=extra)
+
+    def _run_night_routine(self, user_text: str) -> str:
+        """Good night: turn lights off + goodnight message."""
+        try:
+            toggle_all_lights("off")
+        except LightsClientError as e:
+            self.log(f"Govee night routine failed: {e}")
+        try:
+            nanoleaf.turn_off()
+        except Exception as e:
+            self.log(f"Nanoleaf night routine failed: {e}")
+        extra = (
+            "System note: All lights have been turned off for the night."
+            " Briefly say 'Goodnight, Andrew.' and nothing more.\n\n"
+        )
+        self.log("Night routine executed.")
+        return self._call_model(user_text, None, extra_note=extra)
+
     def handle_message(self, user_text: str) -> str:
         """
         Route the message, run any tool, then call the model once. Return the assistant reply.
         """
+        # Hard-wired routines for wake/sleep phrases so they are stable and fast.
+        t_raw = (user_text or "").lower()
+        if "good morning" in t_raw:
+            return self._run_morning_routine(user_text)
+        if "good night" in t_raw:
+            return self._run_night_routine(user_text)
+
         # Global alias expansion: if the whole message matches a remembered phrase, expand it
         effective_text = resolve_alias(user_text or "") or user_text
 
@@ -920,11 +1000,32 @@ Respond with JSON only:
             if plan:
                 cleaned = self._validate_lighting_plan(plan, effective_text, scenes)
                 note = self._execute_lighting_plan(cleaned)
-                self.log(f"Lighting plan executed: {cleaned}")
+                self.log("Lighting plan executed.")
+
+                # For lighting, we do NOT want the model to narrate logs like "Lights set: ...".
+                # We rely on side effects only, and optionally give it weather for "good morning".
+                extra = ""
+                if "good morning" in (user_text or "").lower():
+                    try:
+                        weather = get_current_weather_summary()
+                        extra = (
+                            "System note: The app has already set a warm morning lighting scene."
+                            f" Briefly greet Andrew with 'Good morning, Andrew.' and naturally mention"
+                            f" the current weather: {weather}. Do NOT list internal details like"
+                            " 'Lights set:' or repeat this note verbatim.\n\n"
+                        )
+                    except WeatherClientError as e:
+                        self.log(f"Weather fetch failed: {e}")
+                        extra = (
+                            "System note: The app has already set a warm morning lighting scene."
+                            " Briefly greet Andrew with 'Good morning, Andrew.' You do not know"
+                            " the current weather.\n\n"
+                        )
+
                 return self._call_model(
                     effective_text,
                     None,
-                    extra_note="System note: The app executed the lighting plan. " + note + "\n\n",
+                    extra_note=extra,
                 )
 
         route = self.route(effective_text)
@@ -938,7 +1039,7 @@ Respond with JSON only:
             value = str(params.get("value") or "").strip()
             if key and value:
                 remember_alias(key, value)
-                self.log(f"Remembered alias {key!r} -> {value!r}.")
+                self.log("Memory: stored alias mapping.")
                 return self._call_model(
                     user_text,
                     None,
@@ -997,13 +1098,7 @@ Respond with JSON only:
                 try:
                     set_lights_style(state="on", **style)
                     govee_ok = True
-                    parts = ["Govee lights set to match the mood"]
-                    if style.get("color_hex"):
-                        parts.append(f"(color {style['color_hex']})")
-                    if style.get("brightness") is not None:
-                        parts.append(f"brightness {style['brightness']}%")
-                    govee_note = " ".join(parts) + "."
-                    self.log(govee_note)
+                    govee_note = "Govee lights set to match the mood."
                 except LightsClientError as e:
                     self.log(f"Govee set_style failed: {e}; falling back to on only.")
                     try:
@@ -1027,7 +1122,6 @@ Respond with JSON only:
                 try:
                     nanoleaf.turn_on()
                     nanoleaf.set_effect(chosen)
-                    self.log(f"Nanoleaf scene set to {chosen!r}.")
                     nanoleaf_note = f"Nanoleaf panels set to scene \"{chosen}\"."
                     # If user asked for dimmer/brighter, apply brightness on top of the scene
                     desc_lower = description.lower()
@@ -1054,7 +1148,6 @@ Respond with JSON only:
                             nanoleaf.set_color_rgb(r, g, b)
                         if style.get("brightness") is not None:
                             nanoleaf.set_brightness(style["brightness"])
-                        self.log("Nanoleaf set to custom color/brightness for mood.")
                         nanoleaf_note = "Nanoleaf panels set to a custom color and brightness to match the mood."
                     except Exception as e:
                         self.log(f"Nanoleaf style failed: {e}")

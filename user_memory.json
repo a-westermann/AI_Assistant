@@ -1,5 +1,8 @@
 {
   "aliases": {
-    "writing mode": "orange at 35% brightness"
+    "good morning": "Turn both the Nanoleaf and Govee lights on to a static, warm, gentle morning color at 35% brightness. Do NOT tell me about the lights or news of any kind. Instead say: 'Good morning, Andrew.' Then give me a brief summary and weather for the day.",
+    "good night": "Turn off both the Nanoleaf and Govee lights and say: Goodnight, Andrew.",
+    "writing mode": "orange at 35% brightness. Respond with 'Lights set to writing mode.'"
   }
 }
+

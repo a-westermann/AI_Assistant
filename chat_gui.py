@@ -5,7 +5,7 @@ import threading
 import tkinter as tk
 from tkinter import scrolledtext
 
-from test import ask_lmstudio
+from llm import ask_lmstudio
 from lights_client import (
     get_lights_state,
     toggle_all_lights,
@@ -822,7 +822,7 @@ Previous routed action (JSON or null):
             self._log_event(str(e))
         self.last_route = self._assistant_engine.last_route
         self.last_user_message = user_text
-        self.root.after(0, lambda: self.append_message("Assistant", reply))
+        self.root.after(0, lambda: self.append_message("Galadrial", reply))
 
     def call_model_and_display(
         self,
@@ -871,7 +871,7 @@ Previous routed action (JSON or null):
             self._log_event(text)
 
         # Schedule UI update on the main thread
-        self.root.after(0, lambda: self.append_message("Assistant", text))
+        self.root.after(0, lambda: self.append_message("Galadrial", text))
 
     # ----- Plex sync ----------------------------------------------------------
 
