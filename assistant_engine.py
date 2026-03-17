@@ -144,6 +144,248 @@ class AssistantEngine:
         self.last_route: dict | None = None
         self.last_user_message: str | None = None
 
+    def _is_lighting_related(self, text: str) -> bool:
+        t = (text or "").lower()
+        return any(w in t for w in ("light", "lights", "nanoleaf", "govee", "scene", "brightness", "dim", "bright"))
+
+    def _parse_lighting_plan(self, user_text: str, scene_list: list[str]) -> dict | None:
+        """
+        LLM semantic parser: user text -> structured plan JSON (NO tool choice).
+        The plan must be deterministic enough for code to execute.
+        """
+        scenes_blob = ", ".join(scene_list) if scene_list else "(none)"
+        prompt = f"""You are Galadrial. Parse the user's message into a structured LIGHTING PLAN JSON.
+Do NOT choose code tools or APIs. Do NOT mention tools. Only describe what should happen.
+
+Available Nanoleaf predefined scenes (must pick from this exact list if user asks for a scene): {scenes_blob}
+
+Schema:
+{{
+  "targets": ["nanoleaf", "govee"],          # affected devices
+  "exclude": ["govee"],                     # devices explicitly excluded
+  "actions": [
+    {{
+      "device": "nanoleaf" | "govee",
+      "type": "power" | "static_color" | "brightness" | "animation" | "scene",
+      "state": "on" | "off" | null,         # for power
+      "color_hex": "#RRGGBB" | null,        # for static_color
+      "colors_hex": ["#RRGGBB", ...] | null,# for animation (2-6 colors)
+      "scene_name": "Scene Name" | null,    # for scene (must be from list)
+      "brightness": 0-100 | null,           # for static_color/brightness
+      "speed": 0.5-5 | null,                # for animation
+      "animation": true | false | null      # if user specifies no animation
+    }}
+  ]
+}}
+
+Hard rules:
+- If user says static/solid/no animation/no movement -> must produce type \"static_color\" (animation=false) NOT animation.
+- If user says animation/flow/cycle/pulse/moving -> type must be \"animation\" (animation=true).
+- If user asks to choose from predefined scenes / a scene / an effect -> type must be \"scene\" with scene_name chosen from the available list.
+- If user says \"just/only nanoleaf\" -> targets must be [\"nanoleaf\"], exclude must include \"govee\".
+  The ONLY allowed govee action in that case is power off (if explicitly requested).
+- If user says \"turn govee off\" -> include govee power off.
+- If user mentions a color name, convert it to a reasonable hex (green=#00FF00, orange=#FFA500, purple=#800080, etc.).
+- If user mentions a percent, set brightness to that number. If user says dim/dimmer/dark -> 20-40. bright/brighter/max -> 80-100.
+- If brightness is not mentioned, brightness may be null.
+
+User: \"{user_text}\"
+
+Reply with JSON only (no markdown)."""
+        try:
+            response = ask_lmstudio(prompt)
+            raw = (response.get("output") or [{}])[0].get("content", "").strip()
+            if raw.startswith("```"):
+                parts = raw.split("```")
+                if len(parts) >= 2:
+                    raw = parts[1].strip()
+            plan = json.loads(raw)
+            return plan if isinstance(plan, dict) else None
+        except Exception as e:
+            self.log(f"Lighting plan parse failed: {e}")
+            return None
+
+    def _validate_lighting_plan(self, plan: dict, user_text: str, scene_list: list[str]) -> dict:
+        """Clamp and enforce safety constraints; returns a cleaned plan dict."""
+        cleaned: dict = {"targets": [], "exclude": [], "actions": []}
+        targets = plan.get("targets") if isinstance(plan.get("targets"), list) else []
+        exclude = plan.get("exclude") if isinstance(plan.get("exclude"), list) else []
+        cleaned["targets"] = [str(x).lower() for x in targets if str(x).lower() in ("nanoleaf", "govee")]
+        cleaned["exclude"] = [str(x).lower() for x in exclude if str(x).lower() in ("nanoleaf", "govee")]
+        actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            device = str(a.get("device") or "").lower()
+            atype = str(a.get("type") or "").lower()
+            if device not in ("nanoleaf", "govee"):
+                continue
+            if atype not in ("power", "static_color", "brightness", "animation", "scene"):
+                continue
+            out = {"device": device, "type": atype}
+            if atype == "power":
+                state = str(a.get("state") or "").lower()
+                out["state"] = "on" if state == "on" else "off"
+            if atype == "brightness":
+                b = a.get("brightness")
+                try:
+                    out["brightness"] = max(0, min(100, int(b)))
+                except Exception:
+                    out["brightness"] = None
+            if atype == "static_color":
+                ch = a.get("color_hex")
+                if isinstance(ch, str) and ch.strip().startswith("#") and len(ch.strip()) == 7:
+                    out["color_hex"] = ch.strip()
+                else:
+                    out["color_hex"] = None
+                b = a.get("brightness")
+                try:
+                    out["brightness"] = max(0, min(100, int(b))) if b is not None else None
+                except Exception:
+                    out["brightness"] = None
+            if atype == "animation":
+                cols = a.get("colors_hex")
+                if isinstance(cols, list):
+                    out_cols = []
+                    for c in cols:
+                        s = str(c).strip()
+                        if s.startswith("#") and len(s) == 7:
+                            out_cols.append(s)
+                    out["colors_hex"] = out_cols[:6]
+                else:
+                    out["colors_hex"] = []
+                sp = a.get("speed")
+                try:
+                    out["speed"] = max(0.5, min(5.0, float(sp))) if sp is not None else 1.0
+                except Exception:
+                    out["speed"] = 1.0
+            if atype == "scene":
+                name = a.get("scene_name")
+                if isinstance(name, str):
+                    scene = name.strip()
+                    # Only allow selecting scenes from scenes.txt (exact match)
+                    out["scene_name"] = scene if scene in scene_list else None
+                else:
+                    out["scene_name"] = None
+            cleaned["actions"].append(out)
+
+        # Deterministic scope default: if user only mentioned nanoleaf (not govee, not "lights"),
+        # never allow govee actions unless explicitly requested (e.g. "turn govee off").
+        t = (user_text or "").lower()
+        if "nanoleaf" in t and "govee" not in t and " lights" not in t and not t.startswith("lights"):
+            cleaned["exclude"] = list(set(cleaned["exclude"] + ["govee"]))
+
+        # Enforce: if govee excluded, only allow govee power off actions.
+        if "govee" in cleaned["exclude"]:
+            new_actions = []
+            for a in cleaned["actions"]:
+                if a["device"] != "govee":
+                    new_actions.append(a)
+                elif a["type"] == "power" and a.get("state") == "off":
+                    new_actions.append(a)
+            cleaned["actions"] = new_actions
+
+        # Drop invalid scene actions (no matching scene_name).
+        cleaned["actions"] = [
+            a for a in cleaned["actions"] if not (a["type"] == "scene" and not a.get("scene_name"))
+        ]
+
+        return cleaned
+
+    def _execute_lighting_plan(self, plan: dict) -> str:
+        """Deterministically execute a validated lighting plan. Returns a short summary for system note."""
+        actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
+        notes: list[str] = []
+        for a in actions:
+            device = a.get("device")
+            atype = a.get("type")
+            if device == "govee":
+                if atype == "power":
+                    state = a.get("state", "off")
+                    try:
+                        toggle_all_lights("on" if state == "on" else "off")
+                        notes.append(f"Govee turned {state}.")
+                    except LightsClientError as e:
+                        self.log(f"Govee power failed: {e}")
+                        notes.append("Govee update failed.")
+                elif atype == "static_color":
+                    try:
+                        set_lights_style(
+                            state="on",
+                            color_hex=a.get("color_hex"),
+                            brightness=a.get("brightness"),
+                        )
+                        notes.append("Govee set to static color/brightness.")
+                    except LightsClientError as e:
+                        self.log(f"Govee static_color failed: {e}")
+                        notes.append("Govee update failed.")
+                elif atype == "brightness":
+                    try:
+                        set_lights_style(state="on", brightness=a.get("brightness"))
+                        notes.append("Govee brightness updated.")
+                    except LightsClientError as e:
+                        self.log(f"Govee brightness failed: {e}")
+                        notes.append("Govee update failed.")
+
+            if device == "nanoleaf":
+                if atype == "power":
+                    state = a.get("state", "off")
+                    try:
+                        if state == "on":
+                            nanoleaf.turn_on()
+                        else:
+                            nanoleaf.turn_off()
+                        notes.append(f"Nanoleaf turned {state}.")
+                    except Exception as e:
+                        self.log(f"Nanoleaf power failed: {e}")
+                        notes.append("Nanoleaf update failed.")
+                elif atype == "brightness":
+                    b = a.get("brightness")
+                    try:
+                        if b is not None:
+                            nanoleaf.set_brightness(int(b))
+                            notes.append("Nanoleaf brightness updated.")
+                    except Exception as e:
+                        self.log(f"Nanoleaf brightness failed: {e}")
+                        notes.append("Nanoleaf update failed.")
+                elif atype == "static_color":
+                    ch = a.get("color_hex")
+                    b = a.get("brightness")
+                    try:
+                        nanoleaf.turn_on()
+                        if isinstance(ch, str) and ch.startswith("#") and len(ch) == 7:
+                            r, g, bb = int(ch[1:3], 16), int(ch[3:5], 16), int(ch[5:7], 16)
+                            nanoleaf.set_color_rgb(r, g, bb)
+                        if b is not None:
+                            nanoleaf.set_brightness(int(b))
+                        notes.append("Nanoleaf set to static color/brightness.")
+                    except Exception as e:
+                        self.log(f"Nanoleaf static_color failed: {e}")
+                        notes.append("Nanoleaf update failed.")
+                elif atype == "animation":
+                    cols = a.get("colors_hex") or []
+                    speed = a.get("speed") or 1.0
+                    try:
+                        if isinstance(cols, list) and len(cols) >= 2:
+                            rgb = [(int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)) for c in cols]
+                            nanoleaf.create_flow_effect(rgb, float(speed))
+                            notes.append("Nanoleaf animation applied.")
+                    except Exception as e:
+                        self.log(f"Nanoleaf animation failed: {e}")
+                        notes.append("Nanoleaf update failed.")
+                elif atype == "scene":
+                    name = a.get("scene_name")
+                    try:
+                        if isinstance(name, str) and name.strip():
+                            nanoleaf.turn_on()
+                            nanoleaf.set_effect(name.strip())
+                            notes.append(f"Nanoleaf scene set to '{name.strip()}'.")
+                    except Exception as e:
+                        self.log(f"Nanoleaf scene failed: {e}")
+                        notes.append("Nanoleaf update failed.")
+
+        return " ".join(notes) if notes else "No lighting changes applied."
+
     def _route_speed_adjust(self, user_text: str) -> dict | None:
         """If the user is asking to change animation speed and last action was nanoleaf.create_animation, return a route that re-applies the same animation with new speed. Otherwise return None."""
         if self.last_route is None or self.last_route.get("action") != "nanoleaf.create_animation":
@@ -669,6 +911,21 @@ Respond with JSON only:
         """
         # Global alias expansion: if the whole message matches a remembered phrase, expand it
         effective_text = resolve_alias(user_text or "") or user_text
+
+        # New structured-plan pipeline for lighting requests (semantic parse -> deterministic executor).
+        # Keep the old tool-choice router for non-lighting (gmail/plex/etc.) and for memory.remember.
+        if self._is_lighting_related(effective_text) and "remember that" not in (effective_text or "").lower():
+            scenes = nanoleaf.get_scene_list()
+            plan = self._parse_lighting_plan(effective_text, scenes)
+            if plan:
+                cleaned = self._validate_lighting_plan(plan, effective_text, scenes)
+                note = self._execute_lighting_plan(cleaned)
+                self.log(f"Lighting plan executed: {cleaned}")
+                return self._call_model(
+                    effective_text,
+                    None,
+                    extra_note="System note: The app executed the lighting plan. " + note + "\n\n",
+                )
 
         route = self.route(effective_text)
         action = (route.get("action") or "none").lower()
