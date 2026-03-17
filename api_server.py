@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from assistant_engine import handle_message
+from daily_briefing import gather_briefing_data, format_briefing_for_web
 from dnd_loader import (
     build_context_from_llm_selection,
     get_selection_catalog,
@@ -137,6 +138,24 @@ async def root():
 async def dnd_page():
     """Serve the D&D improv page: record mic, transcribe, get suggested dialogue."""
     return get_dnd_html()
+
+
+@app.get("/briefing", response_class=HTMLResponse)
+@app.get("/briefing/", response_class=HTMLResponse)
+async def briefing_page():
+    """Serve the daily briefing dashboard."""
+    return get_briefing_html()
+
+
+@app.get("/briefing/data")
+async def briefing_data():
+    """Return briefing data as JSON for the dashboard to poll."""
+    try:
+        data = gather_briefing_data()
+        return format_briefing_for_web(data)
+    except Exception as e:
+        logger.exception("Briefing data failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
@@ -412,6 +431,245 @@ def get_dnd_html() -> str:
         sendBtn.disabled = false;
       }
     });
+  </script>
+</body>
+</html>
+"""
+
+
+def get_briefing_html() -> str:
+    """Daily briefing dashboard: shows time, email counts, light status at a glance."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Briefing - Galadrial</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: #0b0d10;
+      color: #f7f7f7;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    h1 {
+      font-family: 'Cinzel', serif;
+      font-size: 1.6rem;
+      color: #f0b34a;
+      margin-bottom: 0.25rem;
+      letter-spacing: 0.05em;
+    }
+    .subtitle {
+      color: #9a9fb2;
+      font-size: 0.9rem;
+      font-weight: 300;
+      margin-bottom: 2rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      width: 100%;
+      max-width: 600px;
+    }
+    .card {
+      background: #11141a;
+      border-radius: 12px;
+      padding: 1.25rem;
+      border: 1px solid #1a1e28;
+      transition: border-color 0.3s;
+    }
+    .card:hover { border-color: #f0b34a33; }
+    .card.wide { grid-column: 1 / -1; }
+    .card-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #9a9fb2;
+      margin-bottom: 0.5rem;
+    }
+    .card-value {
+      font-size: 1.8rem;
+      font-weight: 600;
+      color: #f7f7f7;
+    }
+    .card-value.small { font-size: 1.1rem; font-weight: 400; }
+    .card-value .unit {
+      font-size: 0.9rem;
+      font-weight: 300;
+      color: #9a9fb2;
+    }
+    .email-breakdown {
+      display: flex;
+      gap: 1rem;
+      margin-top: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .email-cat {
+      font-size: 0.85rem;
+      color: #9a9fb2;
+    }
+    .email-cat .count {
+      color: #f0b34a;
+      font-weight: 600;
+    }
+    .status-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 0.5rem;
+      vertical-align: middle;
+    }
+    .status-dot.on { background: #4ade80; box-shadow: 0 0 8px #4ade8066; }
+    .status-dot.off { background: #555; }
+    .status-dot.unknown { background: #f0b34a; }
+    .briefing-btn {
+      display: block;
+      margin: 2rem auto 0;
+      padding: 0.75rem 2rem;
+      background: #f0b34a;
+      color: #050608;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .briefing-btn:hover { background: #e0a33a; }
+    .briefing-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    #briefing-reply {
+      margin-top: 1.5rem;
+      padding: 1rem;
+      max-width: 600px;
+      width: 100%;
+      background: #151922;
+      border-radius: 8px;
+      border-left: 4px solid #f0b34a;
+      font-size: 0.95rem;
+      line-height: 1.6;
+      min-height: 0;
+      display: none;
+    }
+    .loading { color: #9a9fb2; font-style: italic; }
+    .error { color: #e55; }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .fade-in { animation: fadeIn 0.4s ease-out; }
+    @media (max-width: 480px) {
+      .grid { grid-template-columns: 1fr; }
+      .card-value { font-size: 1.4rem; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Galadrial</h1>
+  <div class="subtitle" id="datetime">Loading...</div>
+  <div class="grid" id="grid">
+    <div class="card">
+      <div class="card-label">Unread Email</div>
+      <div class="card-value" id="email-total">&mdash;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Lights</div>
+      <div class="card-value small" id="lights-status">&mdash;</div>
+    </div>
+    <div class="card wide">
+      <div class="card-label">Email Breakdown</div>
+      <div class="email-breakdown" id="email-breakdown">
+        <span class="email-cat">Loading...</span>
+      </div>
+    </div>
+  </div>
+  <button class="briefing-btn" id="briefingBtn">Get Briefing</button>
+  <div id="briefing-reply"></div>
+  <script>
+    const grid = document.getElementById('grid');
+    const datetimeEl = document.getElementById('datetime');
+    const emailTotal = document.getElementById('email-total');
+    const lightsStatus = document.getElementById('lights-status');
+    const emailBreakdown = document.getElementById('email-breakdown');
+    const briefingBtn = document.getElementById('briefingBtn');
+    const briefingReply = document.getElementById('briefing-reply');
+
+    async function loadData() {
+      try {
+        const r = await fetch('/briefing/data');
+        if (!r.ok) throw new Error('Failed to load');
+        const d = await r.json();
+        datetimeEl.textContent = (d.date || '') + '  \\u00b7  ' + (d.time || '');
+        if (d.email_error) {
+          emailTotal.textContent = '\\u2014';
+          emailTotal.title = 'Gmail not configured';
+        } else if (d.email_total !== null && d.email_total !== undefined) {
+          emailTotal.textContent = d.email_total;
+        } else {
+          emailTotal.textContent = '\\u2014';
+        }
+        const state = d.lights_state;
+        if (state === 'on') {
+          lightsStatus.innerHTML = '<span class="status-dot on"></span>On';
+        } else if (state === 'off') {
+          lightsStatus.innerHTML = '<span class="status-dot off"></span>Off';
+        } else {
+          lightsStatus.innerHTML = '<span class="status-dot unknown"></span>Unknown';
+        }
+        const cats = [
+          { key: 'email_primary', label: 'Primary' },
+          { key: 'email_updates', label: 'Updates' },
+          { key: 'email_social', label: 'Social' },
+          { key: 'email_promotions', label: 'Promos' },
+        ];
+        const parts = cats
+          .filter(c => d[c.key] !== null && d[c.key] !== undefined)
+          .map(c => '<span class="email-cat">' + c.label + ': <span class="count">' + d[c.key] + '</span></span>');
+        emailBreakdown.innerHTML = parts.length ? parts.join('') : '<span class="email-cat">No category data</span>';
+        grid.classList.add('fade-in');
+      } catch (err) {
+        datetimeEl.textContent = 'Could not load briefing data';
+      }
+    }
+
+    briefingBtn.addEventListener('click', async () => {
+      briefingBtn.disabled = true;
+      briefingReply.style.display = 'block';
+      briefingReply.className = 'loading';
+      briefingReply.textContent = 'Gathering your briefing...';
+      try {
+        const r = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: 'good morning, give me my daily briefing' })
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          briefingReply.className = 'error';
+          briefingReply.textContent = data.detail || 'Briefing failed';
+          return;
+        }
+        briefingReply.className = 'fade-in';
+        briefingReply.textContent = data.reply || 'No response.';
+        loadData();
+      } catch (err) {
+        briefingReply.className = 'error';
+        briefingReply.textContent = err.message || 'Network error';
+      } finally {
+        briefingBtn.disabled = false;
+      }
+    });
+
+    loadData();
+    setInterval(loadData, 60000);
   </script>
 </body>
 </html>
