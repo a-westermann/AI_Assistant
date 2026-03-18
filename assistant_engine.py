@@ -1,3 +1,8 @@
+"""
+Headless assistant engine: route user message, run tools, call LLM, return reply string.
+Used by both the desktop GUI and the FastAPI server.
+"""
+
 import json
 import os
 import re
@@ -36,217 +41,96 @@ TOOLS = [
     },
     {
         "name": "lights.set_state",
-        "description": "Turn BOTH Govee and Nanoleaf lights on, off, or set Govee to automatic mode. Use only when the user explicitly says on, off, or auto/automatic—not for moods or scenes.",
+        "description": "Turn BOTH Govee and Nanoleaf lights on, off, or set Govee to automatic mode. Use only when the user explicitly says on, off, or auto/automatic\u2014not for moods or scenes.",
         "params": [{"name": "state", "type": "string", "description": "One of: on, off, auto"}],
     },
     {
         "name": "lights.set_scene",
-        "description": "Set Nanoleaf to a specific scene or color. Use only when user mentions a mood, scene, or color preference (not brightness/on/off).",
-        "params": [{"name": "scene", "type": "string", "description": "Scene name or color description, e.g. 'blue', 'warm', 'energetic'"}],
+        "description": "Set BOTH Govee and Nanoleaf to a mood or atmosphere. Use when the user asks to change how the lights feel: romantic, peaceful, cozy, somber, pulse, gentle, brighter, faster, or any vibe/intent (e.g. 'add a gentle pulse', 'make them pulse faster and brighter'). We set color and brightness to match; there is no real pulse effect. params.description = the user's full request or mood.",
+        "params": [{"name": "description", "type": "string", "description": "The mood or full request (e.g. romantic, somber, gentle pulse, make them brighter)"}],
     },
     {
-        "name": "plex.sync",
-        "description": "Sync the Plex library from disk (this may take 30+ seconds). Use when the user asks to refresh or update the Plex library.",
+        "name": "lights.get_state",
+        "description": "Check whether Govee lights are currently on or off. Use when the user asks about light status or whether the lights are on.",
         "params": [],
     },
     {
-        "name": "weather.current",
-        "description": "Get current weather summary. Use when the user asks about the weather.",
+        "name": "plex_sync.run",
+        "description": "Run the Plex sync app (syncs media to a server) in the background. Use when the user asks to run Plex sync, sync Plex, or start Plex sync.",
         "params": [],
     },
     {
         "name": "gmail.search",
-        "description": "Search Gmail for emails. Use when the user asks to find, check, or search emails.",
-        "params": [{"name": "query", "type": "string", "description": "Gmail search query, e.g. 'from:alice subject:deadline'"}],
-    },
-    {
-        "name": "memory.remember",
-        "description": "Remember something about the user or add an alias. Use when the user tells you something personal or asks you to remember something.",
-        "params": [{"name": "fact", "type": "string", "description": "The fact or alias to remember, e.g. 'Alice is my sister'"}],
-    },
-    {
-        "name": "reminder.add",
-        "description": "Set a reminder to notify the user at a specific time. Use when the user asks to set a reminder, timer, or alarm.",
+        "description": "Search the user\u2019s Gmail inbox. Use when they ask about email, inbox, messages, or things that would be in email (e.g. literary magazine submissions, acceptances).",
         "params": [
-            {"name": "message", "type": "string", "description": "What to remind about"},
-            {"name": "minutes", "type": "number", "description": "Minutes from now to fire the reminder"},
+            {"name": "query", "type": "string", "description": "Short search terms (plain words, no operators)"},
+            {"name": "scope", "type": "string", "description": "unread or all"},
+            {"name": "result_type", "type": "string", "description": "count or list"},
+            {"name": "category", "type": "string", "description": "(optional) updates, primary, promotions, social, forums"},
+            {"name": "broad_search_terms", "type": "array", "description": "(optional) list of terms for list searches to widen results"},
         ],
     },
     {
-        "name": "reminder.cancel",
-        "description": "Cancel a pending reminder by ID. Use when the user wants to cancel a reminder they set earlier.",
-        "params": [{"name": "reminder_id", "type": "number", "description": "ID of the reminder to cancel"}],
+        "name": "nanoleaf.set_scene",
+        "description": "Set ONLY the Nanoleaf panels to a predefined SCENE from the list (e.g. Romantic, Northern Lights, Inner Peace). Use when the user asks for a mood that fits a scene name. Do NOT use for: pulse, 'add a pulse', breathing, 'custom', 'without using scenes', 'make up your own'\u2014use nanoleaf.custom for those.",
+        "params": [{"name": "description", "type": "string", "description": "The mood that should match a scene name (e.g. romantic, peaceful)"}],
+    },
+    {
+        "name": "nanoleaf.custom",
+        "description": "Set BOTH Govee and Nanoleaf to a static color and brightness, or a pulse/custom mood. Use when the user wants a STATIC or SOLID color with NO animation (e.g. 'static purple', 'no animation just blue', 'solid red', 'make them purple but not animated'). Also use for pulse, 'add a pulse', rhythm, or 'make up your own settings'. Interpret their words: if they say static, no animation, solid, or don\u2019t want movement \u2192 this tool sets a single static color; if they want a flowing/animated effect \u2192 use nanoleaf.create_animation instead. Do NOT use for a mood that matches a scene name\u2014use nanoleaf.set_scene instead.",
+        "params": [{"name": "description", "type": "string", "description": "The full request (e.g. static purple, no animation blue, strong pulse, custom somber)"}],
+    },
+    {
+        "name": "nanoleaf.create_animation",
+        "description": "CREATE a flowing/animated color effect on the Nanoleaf panels (colors cycle or flow). Use ONLY when the user clearly wants movement/animation: e.g. 'create an animation', 'flowing colors', 'make them cycle through red and blue', 'new animation'. Do NOT use when they want a static, solid, or non-animated color\u2014use nanoleaf.custom for that. Pick 2\u20136 colors and optional speed.",
+        "params": [
+            {"name": "animation_type", "type": "string", "description": "One of: flow"},
+            {"name": "colors", "type": "array", "description": "List of hex color strings, e.g. [\"#FF0000\", \"#00FF00\", \"#0000FF\"]. Need at least 2 for flow."},
+            {"name": "speed", "type": "number", "description": "(optional) Transition speed 0.5\u20135 (seconds). Default 1."},
+        ],
+    },
+    {
+        "name": "nanoleaf.set_brightness",
+        "description": "Set ONLY the Nanoleaf panels' brightness (no scene change, no color change, no Govee). Use when the user asks to make the Nanoleaf dimmer, brighter, or set to a specific brightness level. Do NOT use lights.set_scene for this\u2014that would change the scene and Govee.",
+        "params": [{"name": "description", "type": "string", "description": "e.g. dimmer, brighter, 50%, half brightness"}],
+    },
+    {
+        "name": "nanoleaf.set_state",
+        "description": "Turn ONLY the Nanoleaf panels on or off. Use when the user says 'turn the nanoleaf off', 'nanoleaf on', 'turn off the nanoleaf', etc. Does NOT change Govee. Do NOT use nanoleaf.custom for power off/on\u2014use this tool.",
+        "params": [{"name": "state", "type": "string", "description": "on or off"}],
+    },
+    {
+        "name": "memory.remember",
+        "description": "Remember a simple mapping the user defines, like 'when I say writing mode, I mean dim orange lights'. Use ONLY when the user explicitly asks you to remember something for the future ('remember that X means Y', 'from now on when I say X do Y').",
+        "params": [
+            {"name": "key", "type": "string", "description": "The phrase to remember (e.g. writing mode)"},
+            {
+                "name": "value",
+                "type": "string",
+                "description": "What it should mean/expand to (e.g. dim orange nanoleaf and warm white govee at 35% brightness)",
+            },
+        ],
+    },
+    {
+        "name": "reminder.set",
+        "description": "Set a timed reminder. Use when the user asks to be reminded of something in a certain amount of time (e.g. 'remind me in 30 minutes to check the oven', 'set a timer for 10 minutes', 'remind me in an hour to call mom'). The Nanoleaf will flash gold when it fires.",
+        "params": [
+            {"name": "message", "type": "string", "description": "What to remind them about (e.g. check the oven, take a break, call mom)"},
+            {"name": "minutes", "type": "number", "description": "How many minutes from now (e.g. 30, 5, 60, 0.5 for 30 seconds)"},
+        ],
     },
     {
         "name": "reminder.list",
-        "description": "List all active reminders. Use when the user asks what reminders they have set.",
+        "description": "List active (pending) reminders. Use when the user asks what reminders they have, 'any reminders?', 'what timers are running?', or 'show my reminders'.",
         "params": [],
+    },
+    {
+        "name": "reminder.cancel",
+        "description": "Cancel a pending reminder. Use when the user asks to cancel or remove a reminder (e.g. 'cancel reminder 1', 'never mind about that reminder', 'cancel my timer').",
+        "params": [
+            {"name": "reminder_id", "type": "number", "description": "The reminder ID to cancel (shown in reminder.list output)"},
+        ],
     },
 ]
 
-
-def handle_message(message: str, log_fn: Optional[Callable[[str], None]] = None) -> str:
-    """Route and process a user message: choose tool, execute, get LLM response."""
-    log = log_fn or (lambda msg: None)
-
-    # Build a prompt for the LLM to choose a tool.
-    tool_descriptions = "\n".join(
-        f"  - {t['name']}: {t['description']}"
-        for t in TOOLS
-    )
-
-    routing_prompt = (
-        "You are a helpful assistant. Based on the user's message, choose ONE tool from the list below. "
-        "Reply with ONLY the tool name (nothing else), or 'none' if no tool applies.\n\n"
-        f"Available tools:\n{tool_descriptions}\n\n"
-        f"User message: {message!r}"
-    )
-
-    routing_response = ask_lmstudio(routing_prompt)
-    tool_name = (routing_response.get("output") or [{}])[0].get("content", "").strip().lower()
-
-    log(f"Routing: message={message!r} -> tool={tool_name}")
-
-    result = None
-    tool_output = ""
-
-    # Execute the chosen tool.
-    if tool_name == "lights.set_state":
-        state_match = re.search(r"\b(on|off|auto)\b", message, re.IGNORECASE)
-        state = state_match.group(1).lower() if state_match else None
-        if state:
-            try:
-                if state == "on":
-                    toggle_all_lights(on=True)
-                    tool_output = "Lights turned on."
-                elif state == "off":
-                    toggle_all_lights(on=False)
-                    tool_output = "Lights turned off."
-                elif state == "auto":
-                    set_lights_auto()
-                    tool_output = "Lights set to automatic."
-            except LightsClientError as e:
-                tool_output = f"Error controlling lights: {e}"
-        else:
-            tool_output = "Could not determine light state from message."
-
-    elif tool_name == "lights.set_scene":
-        scene_match = re.search(r"(?:set|change|go to|make it|switch to)\s+([a-z\s]+?)(?:\.|$|\?)", message, re.IGNORECASE)
-        scene = scene_match.group(1).strip() if scene_match else None
-        if scene:
-            try:
-                set_lights_style(scene)
-                tool_output = f"Lights set to {scene}."
-            except LightsClientError as e:
-                tool_output = f"Error setting light scene: {e}"
-        else:
-            tool_output = "Could not determine desired scene from message."
-
-    elif tool_name == "plex.sync":
-        try:
-            log("Plex sync starting...")
-            result = subprocess.run(
-                [PLEX_SYNC_PY, PLEX_SYNC_MAIN],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            tool_output = result.stdout or result.stderr or "Plex sync complete."
-        except Exception as e:
-            tool_output = f"Error syncing Plex: {e}"
-
-    elif tool_name == "weather.current":
-        try:
-            tool_output = get_current_weather_summary()
-        except WeatherClientError as e:
-            tool_output = f"Error fetching weather: {e}"
-
-    elif tool_name == "gmail.search":
-        query_match = re.search(r"(?:search|find|check)\s+(?:for\s+)?(.+?)(?:\?|$)", message, re.IGNORECASE)
-        query = query_match.group(1).strip() if query_match else None
-        if not query:
-            for term in _GENERIC_BROAD_TERMS:
-                if term.lower() in message.lower():
-                    query = term
-                    break
-        if query:
-            try:
-                results = search_gmail(query)
-                tool_output = results or f"No emails found for '{query}'."
-            except GmailClientError as e:
-                tool_output = f"Error searching Gmail: {e}"
-        else:
-            tool_output = "Could not determine search query."
-
-    elif tool_name == "memory.remember":
-        fact_match = re.search(r"(?:remember|my|is|that\s+)(.+?)(?:\.|$)", message, re.IGNORECASE)
-        fact = fact_match.group(1).strip() if fact_match else message
-        try:
-            remember_alias(fact)
-            tool_output = f"Remembered: {fact}"
-        except Exception as e:
-            tool_output = f"Error remembering: {e}"
-
-    elif tool_name == "reminder.add":
-        minutes_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|m)", message, re.IGNORECASE)
-        minutes = float(minutes_match.group(1)) if minutes_match else 10
-        reminder_msg = re.sub(r"set\s+a?\s+reminder|in\s+\d+\s*(?:minutes?|mins?|m)", "", message, flags=re.IGNORECASE).strip()
-        try:
-            engine = get_reminder_engine(log_fn=log)
-            reminder = engine.add(reminder_msg or "reminder", minutes)
-            tool_output = f"Reminder set for {minutes} minutes: {reminder_msg or 'reminder'}"
-        except Exception as e:
-            tool_output = f"Error setting reminder: {e}"
-
-    elif tool_name == "reminder.list":
-        try:
-            engine = get_reminder_engine(log_fn=log)
-            active = engine.list_active()
-            if active:
-                tool_output = "Active reminders:\n" + "\n".join(
-                    f"  #{r['id']}: {r['message']} (in {r['remaining_seconds']//60}m)"
-                    for r in active
-                )
-            else:
-                tool_output = "No active reminders."
-        except Exception as e:
-            tool_output = f"Error listing reminders: {e}"
-
-    elif tool_name == "reminder.cancel":
-        reminder_id_match = re.search(r"#?(\d+)", message)
-        reminder_id = int(reminder_id_match.group(1)) if reminder_id_match else None
-        if reminder_id:
-            try:
-                engine = get_reminder_engine(log_fn=log)
-                success = engine.cancel(reminder_id)
-                tool_output = f"Reminder #{reminder_id} cancelled." if success else f"Reminder #{reminder_id} not found."
-            except Exception as e:
-                tool_output = f"Error cancelling reminder: {e}"
-        else:
-            tool_output = "Could not find reminder ID in message."
-
-    # Now ask the LLM to generate a final response, given tool_output.
-    if tool_output:
-        final_prompt = (
-            f"Based on the user's request and the tool result below, provide a helpful, natural response. "
-            f"Be concise (1–2 sentences unless more detail is needed).\n\n"
-            f"User: {message}\n"
-            f"Tool result: {tool_output}"
-        )
-    else:
-        final_prompt = (
-            f"The user sent a message. Respond helpfully and naturally. Be concise.\n\n"
-            f"User: {message}"
-        )
-
-    final_response = ask_lmstudio(final_prompt)
-    reply = (final_response.get("output") or [{}])[0].get("content", "").strip()
-
-    log(f"Response: {reply!r}")
-    return reply or "I'm not sure how to respond."
-
-
-if __name__ == "__main__":
-    msg = input("User: ")
-    reply = handle_message(msg, log_fn=print)
-    print("Reply:", reply)
+VALID_ACTIONS = {t["name"] for t in TOOLS}
