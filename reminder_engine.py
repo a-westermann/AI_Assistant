@@ -1,3 +1,9 @@
+"""
+Reminder engine: thread-safe singleton for managing timed reminders.
+When a reminder fires, it optionally flashes the Nanoleaf panels to
+Galadrial's signature gold as a visual notification.
+"""
+
 import json
 import os
 import threading
@@ -50,7 +56,9 @@ class ReminderEngine:
         self._next_id = 1
         self._active: Dict[int, Reminder] = {}
         self._timers: Dict[int, threading.Timer] = {}
-        self._fired_queue: List[Reminder] = []
+        self._fired_queue: List[Reminder] = []  # unacknowledged fired reminders
+
+    # ---- public API ---------------------------------------------------------
 
     def add(self, message: str, minutes: float) -> Reminder:
         """Schedule a new reminder that fires in `minutes` from now."""
@@ -110,6 +118,8 @@ class ReminderEngine:
         with self._lock:
             return list(self._fired_queue)
 
+    # ---- internal -----------------------------------------------------------
+
     def _fire(self, reminder_id: int) -> None:
         """Called by the timer thread when a reminder goes off."""
         with self._lock:
@@ -121,6 +131,7 @@ class ReminderEngine:
             self._fired_queue.append(reminder)
             self.log(f"Reminder #{reminder_id} fired: {reminder.message!r}")
 
+        # Flash lights (outside lock to avoid deadlocks with external APIs)
         if self.on_fire is not None:
             try:
                 self.on_fire(reminder)
@@ -129,19 +140,26 @@ class ReminderEngine:
 
 
 def _flash_lights_notification(reminder: "Reminder") -> None:
-    """Briefly flash Nanoleaf panels to Galadrial's gold for 2 seconds."""
+    """
+    Briefly flash Nanoleaf panels to Galadrial's gold (#f0b34a) for 2 seconds,
+    then restore previous color.  Best-effort; failures are non-fatal.
+    """
     try:
         from nanoleaf import nanoleaf as nl
+
+        # Flash to gold
         nl.turn_on()
-        nl.set_color_rgb(240, 179, 74)
+        nl.set_color_rgb(240, 179, 74)  # #f0b34a
         nl.set_brightness(100)
         time.sleep(2)
+        # Dim back down to a gentle warm glow so we don't blind anyone
         nl.set_brightness(50)
         nl.set_color_rgb(255, 200, 100)
     except Exception:
-        pass
+        pass  # non-fatal; lights may be unreachable
 
 
+# Module-level singleton (lazily created)
 _engine: Optional[ReminderEngine] = None
 _engine_lock = threading.Lock()
 
