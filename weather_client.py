@@ -66,7 +66,8 @@ def get_current_weather_summary() -> str:
     pieces = []
     if isinstance(temp_c, (int, float)):
         temp_f = temp_c * 9.0 / 5.0 + 32.0
-        pieces.append(f"{temp_f:.0f}°F")
+        # ASCII only: keep temperatures as plain numbers followed by F.
+        pieces.append(f"{temp_f:.0f}F")
     pieces.append(description)
     if isinstance(wind, (int, float)):
         # Open-Meteo returns windspeed in km/h by default.

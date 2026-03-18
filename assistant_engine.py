@@ -166,6 +166,84 @@ class AssistantEngine:
             )
         )
 
+    def _is_memory_request(self, text: str) -> bool:
+        """Detect explicit user instructions to store an alias mapping."""
+        t = (text or "").lower()
+        if "remember" not in t:
+            return False
+        return any(
+            s in t
+            for s in (
+                "remember that",
+                "remember when",
+                "from now on",
+                "when i say",
+                "i mean",
+                "means",
+                "do this when",
+            )
+        )
+
+    def _is_weather_query(self, text: str) -> bool:
+        """Detect whether the user is asking for current weather information."""
+        t = (text or "").lower()
+        return any(k in t for k in ("weather", "forecast", "temperature", "temp", "degree", "degrees"))
+
+    def _try_parse_remember_mapping(self, user_text: str) -> tuple[str, str] | None:
+        """
+        Parse mappings like:
+        - "remember that X means Y"
+        - "remember when I say X I mean Y"
+        - "from now on when i say X i mean Y"
+        """
+        if not self._is_memory_request(user_text):
+            return None
+
+        original = user_text or ""
+        lower = original.lower()
+
+        # Case 1: "remember that X means Y"
+        if "remember that" in lower:
+            start = lower.index("remember that") + len("remember that")
+            # Prefer " means " separator; fall back to " i mean "
+            means_idx = lower.find(" means ", start)
+            imean_idx = lower.find(" i mean ", start)
+            if means_idx == -1:
+                means_idx = imean_idx
+                sep_len = len(" i mean ")
+            else:
+                sep_len = len(" means ")
+            if means_idx != -1:
+                key = original[start:means_idx].strip().strip("\"'")
+                value = original[means_idx + sep_len :].strip().strip()
+                value = value.strip().strip(".")
+                if value.lower().startswith("to "):
+                    value = value[3:].strip()
+                if key and value:
+                    return key, value
+
+        # Case 2: "remember when i say X i mean Y"
+        if "when i say" in lower:
+            start = lower.index("when i say") + len("when i say")
+            candidates = [" i mean ", " i mean to ", " means ", " mean ", " i.e. "]
+            end = -1
+            end_sep = ""
+            for c in candidates:
+                idx = lower.find(c, start)
+                if idx != -1 and (end == -1 or idx < end):
+                    end = idx
+                    end_sep = c
+            if end != -1:
+                key = original[start:end].strip().strip("\"'")
+                value = original[end + len(end_sep) :].strip().strip()
+                value = value.strip().strip(".")
+                if value.lower().startswith("to "):
+                    value = value[3:].strip()
+                if key and value:
+                    return key, value
+
+        return None
+
     def _parse_lighting_plan(self, user_text: str, scene_list: list[str]) -> dict | None:
         """
         LLM semantic parser: user text -> structured plan JSON (NO tool choice).
@@ -600,6 +678,11 @@ Respond with JSON only:
             "You are Galadrial, an AI assistant embedded in a desktop GUI.\n\n"
             "- Your user's name is Andrew. Give short, concise responses."
             " Always be warm and friendly.\n"
+            "- IMPORTANT OUTPUT FORMAT: Output plain text only (no markdown, no code fences)."
+            " Use ASCII characters only. Do not use emojis or decorative symbols,"
+            " and avoid bullet points or special typographic punctuation."
+            " When you write your reply, use normal sentences; do not start any line"
+            " with '-' or '•'."
             "- The app can control my Govee lights via an API. When you see a system note telling"
             " you that the lights were set to a state, you may speak as if that action has already"
             " been performed.\n"
@@ -616,6 +699,9 @@ Respond with JSON only:
             " facts, you must say that you don't know instead of making something up.\n"
             "- You may still answer general questions with your own knowledge, but never fabricate"
             " concrete details about my life or accounts.\n\n"
+            "- Weather safety: If the user asks for the current weather, you may only state"
+            " it when you were given a System note or tool result that contains the weather."
+            " Otherwise, say you don't know.\n\n"
             "- The user has a D&D campaign folder (notes and maps). You do not have access to it"
             " from this chat. If they ask, say that the D&D improv feature does: when they open"
             " http://localhost:8000/dnd in a browser (with the API server running), they can"
@@ -989,12 +1075,33 @@ Respond with JSON only:
         if "good night" in t_raw:
             return self._run_night_routine(user_text)
 
+        # Deterministic weather handling: never guess if the API fails.
+        if self._is_weather_query(user_text):
+            try:
+                weather = get_current_weather_summary()
+                return f"Right now: {weather}."
+            except WeatherClientError:
+                return "I can't fetch the current weather right now. Please try again shortly."
+
         # Global alias expansion: if the whole message matches a remembered phrase, expand it
         effective_text = resolve_alias(user_text or "") or user_text
 
+        # If the user explicitly asks us to remember something, store it deterministically
+        # before any lighting routing (memory requests often contain light-related words).
+        parsed_mapping = self._try_parse_remember_mapping(user_text)
+        if parsed_mapping:
+            key, value = parsed_mapping
+            remember_alias(key, value)
+            self.log("Memory: stored alias mapping (parsed).")
+            return self._call_model(
+                user_text,
+                None,
+                extra_note=f"System note: The app has just remembered that '{key}' means '{value}'. You can acknowledge that briefly.\n\n",
+            )
+
         # New structured-plan pipeline for lighting requests (semantic parse -> deterministic executor).
         # Keep the old tool-choice router for non-lighting (gmail/plex/etc.) and for memory.remember.
-        if self._is_lighting_related(effective_text) and "remember that" not in (effective_text or "").lower():
+        if self._is_lighting_related(effective_text) and not self._is_memory_request(effective_text):
             scenes = nanoleaf.get_scene_list()
             plan = self._parse_lighting_plan(effective_text, scenes)
             if plan:

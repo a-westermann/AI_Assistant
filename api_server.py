@@ -6,13 +6,18 @@ Then open http://<this-pc-ip>:8000/ in a browser from this PC or another device 
 
 import logging
 import socket
+import asyncio
+import os
+import tempfile
+from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from assistant_engine import handle_message
+from faster_whisper import WhisperModel
 from dnd_loader import (
     build_context_from_llm_selection,
     get_selection_catalog,
@@ -23,6 +28,9 @@ from llm import ask_lmstudio, ask_lmstudio_with_images
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+stt_model: WhisperModel | None = None
+stt_lock = asyncio.Lock()
 
 
 def _log_event(msg: str) -> None:
@@ -55,6 +63,10 @@ async def lifespan(app: FastAPI):
     port = 8000
     for ip in _lan_ips():
         logger.info("LAN URL: http://%s:%s/ (use this from phone/other devices on same WiFi)", ip, port)
+
+    # Whisper STT is loaded lazily on the first /stt request so server startup
+    # doesn't block on downloading the model.
+    logger.info("Whisper STT will load on first /stt request.")
     yield
     logger.info("Shutting down.")
 
@@ -71,6 +83,10 @@ class ChatResponse(BaseModel):
 
 
 class DndImprovRequest(BaseModel):
+    transcript: str
+
+
+class SttResponse(BaseModel):
     transcript: str
 
 
@@ -93,7 +109,7 @@ async def dnd_improv(body: DndImprovRequest):
                 "available campaign notes (chunk number and preview) and map filenames. "
                 "Reply with ONLY two lines: which chunk numbers are relevant (CHUNKS: 0, 1, 3), "
                 "and which map filenames are relevant (MAPS: file.png, or MAPS: none). "
-                "Pick only what is needed for the current conversation.\n\n"
+                    "Pick only what is needed for the current conversation. Use plain ASCII text only; no emojis.\n\n"
                 "--- Recent conversation ---\n"
                 f"{transcript or '(no transcript)'}\n\n"
                 "--- Catalog ---\n"
@@ -112,6 +128,7 @@ async def dnd_improv(body: DndImprovRequest):
             "You are an improv assistant for a D&D DM. Use the following campaign notes and character context "
             "(and the attached maps if any). Given the recent conversation at the table, suggest short dialogue "
             "or description the DM can read aloud. Reply with only the suggested text (1–3 sentences unless more is needed).\n\n"
+            "Use plain ASCII text only. No emojis, no special typographic symbols, and no markdown.\n\n"
             "--- Campaign notes ---\n"
             f"{ctx.notes_text}\n\n"
             "--- Recent conversation ---\n"
@@ -137,6 +154,59 @@ async def root():
 async def dnd_page():
     """Serve the D&D improv page: record mic, transcribe, get suggested dialogue."""
     return get_dnd_html()
+
+
+@app.post("/stt", response_model=SttResponse)
+async def stt_audio(file: UploadFile = File(...)):
+    """Server-side speech-to-text for the web UI mic button (Whisper)."""
+    global stt_model
+
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio upload.")
+
+    # WhisperModel expects a real file path; write to a temp file.
+    suffix = Path(file.filename or "").suffix.lower() or ".webm"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        async with stt_lock:
+            if stt_model is None:
+                whisper_model_name = os.environ.get("WHISPER_MODEL", "base.en")
+                whisper_device = os.environ.get("WHISPER_DEVICE", "cpu")
+                whisper_compute_type = os.environ.get(
+                    "WHISPER_COMPUTE_TYPE",
+                    "int8" if whisper_device.lower() == "cpu" else "float16",
+                )
+                stt_model = await asyncio.to_thread(
+                    lambda: WhisperModel(
+                        whisper_model_name,
+                        device=whisper_device,
+                        compute_type=whisper_compute_type,
+                    )
+                )
+
+            def _do_transcribe() -> str:
+                segments, _info = stt_model.transcribe(
+                    tmp_path,
+                    language="en",
+                    task="transcribe",
+                    vad_filter=True,
+                    beam_size=1,
+                )
+                return " ".join((seg.text or "").strip() for seg in segments).strip()
+
+            transcript = await asyncio.to_thread(_do_transcribe)
+        return SttResponse(transcript=transcript or "")
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 @app.get("/health")
@@ -173,27 +243,29 @@ def get_client_html() -> str:
       background: #0b0d10;
       color: #f7f7f7;
       margin: 0;
-      min-height: 100vh;
+      height: 100vh;      /* fallback */
+      height: 100dvh;    /* mobile browser dynamic viewport height */
       display: flex;
       flex-direction: column;
     }
-    h1 { margin: 1rem; font-size: 1.25rem; color: #f0b34a; }
+    h1 { margin: 0.75rem 1rem 0.5rem; font-size: 1.25rem; color: #f0b34a; }
     #log {
-      flex: 1;
+      flex: 1 1 auto;
       overflow: auto;
+      min-height: 0;
       padding: 1rem;
-      margin: 0 1rem 1rem;
+      margin: 0 1rem 0.5rem;
       background: #11141a;
       border-radius: 8px;
       font-size: 0.95rem;
       line-height: 1.5;
     }
     #log .you { color: #9a9fb2; margin-bottom: 0.5rem; }
-    #log .assistant { color: #f7f7f7; margin-bottom: 1rem; }
+    #log .assistant { color: #f7f7f7; margin-bottom: 0.75rem; }
     #form {
       display: flex;
       gap: 0.5rem;
-      padding: 1rem;
+      padding: 0.75rem 1rem;
       background: #11141a;
     }
     #input {
@@ -222,9 +294,17 @@ def get_client_html() -> str:
 </head>
 <body>
   <h1>Galadrial</h1>
+  <div id="tts" style="padding: 0 1rem 0.5rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
+    <label style="display:flex; gap:0.4rem; align-items:center; color:#cdd0e0; font-size:0.95rem;">
+      <input type="checkbox" id="speakToggle" checked />
+      Speak responses
+    </label>
+    <select id="voiceSelect" style="background:#151922; color:#f7f7f7; border:1px solid #222733; border-radius:8px; padding:0.4rem 0.6rem;"></select>
+  </div>
   <div id="log"></div>
   <form id="form">
     <input type="text" id="input" placeholder="Message..." autocomplete="off" />
+    <button type="button" id="mic" title="Voice input">Mic</button>
     <button type="submit" id="send">Send</button>
   </form>
   <script>
@@ -232,6 +312,77 @@ def get_client_html() -> str:
     const form = document.getElementById('form');
     const input = document.getElementById('input');
     const sendBtn = document.getElementById('send');
+    const micBtn = document.getElementById('mic');
+    const speakToggle = document.getElementById('speakToggle');
+    const voiceSelect = document.getElementById('voiceSelect');
+
+    function _stripGaladrialPrefix(text) {
+      const t = (text || '').toString().trim();
+      return t.startsWith('Galadrial: ') ? t.slice('Galadrial: '.length) : t;
+    }
+
+    function speak(text) {
+      if (!speakToggle || !speakToggle.checked) return;
+      if (!window.speechSynthesis) return;
+      const t = _stripGaladrialPrefix(text);
+      if (!t) return;
+      try {
+        window.speechSynthesis.cancel();
+        // On some mobile browsers, the voice list updates only after TTS is used.
+        // Re-populate right before speaking so newly installed voices appear.
+        populateVoices();
+        const utter = new SpeechSynthesisUtterance(t);
+        const voices = window.speechSynthesis.getVoices() || [];
+        if (voiceSelect && voiceSelect.value) {
+          const v = voices.find((vv) => vv.name === voiceSelect.value);
+          if (v) {
+            utter.voice = v;
+            if (v.lang) utter.lang = v.lang;
+          }
+        }
+        window.speechSynthesis.speak(utter);
+      } catch (e) {
+        // ignore speech errors
+      }
+    }
+
+    function populateVoices() {
+      if (!voiceSelect || !window.speechSynthesis) return;
+      const voices = window.speechSynthesis.getVoices() || [];
+      const saved = localStorage.getItem('galadrial_tts_voice');
+      voiceSelect.innerHTML = '';
+      voices.forEach((v) => {
+        const opt = document.createElement('option');
+        opt.value = v.name;
+        opt.textContent = `${v.name} (${v.lang})`;
+        voiceSelect.appendChild(opt);
+      });
+      if (saved && voices.some((v) => v.name === saved)) {
+        voiceSelect.value = saved;
+      } else if (voices.length) {
+        const en = (v) => (v && (v.lang || '')).toLowerCase().startsWith('en');
+        const isNatural = (v) => v && /neural|natural/i.test(v.name || '');
+        const best =
+          voices.find((v) => en(v) && isNatural(v)) ||
+          voices.find((v) => isNatural(v)) ||
+          voices.find((v) => en(v)) ||
+          voices[0];
+        voiceSelect.value = best.name;
+      }
+    }
+
+    if (voiceSelect && window.speechSynthesis) {
+      populateVoices();
+      window.speechSynthesis.onvoiceschanged = () => populateVoices();
+      // Some mobile browsers load/install voice packs asynchronously.
+      // Retrying a few times helps ensure newly-installed voices show up.
+      setTimeout(() => populateVoices(), 1000);
+      setTimeout(() => populateVoices(), 2500);
+      setTimeout(() => populateVoices(), 5000);
+      voiceSelect.addEventListener('change', () => {
+        localStorage.setItem('galadrial_tts_voice', voiceSelect.value);
+      });
+    }
 
     function append(sender, text, isError) {
       const div = document.createElement('div');
@@ -239,6 +390,7 @@ def get_client_html() -> str:
       div.textContent = (sender === 'you' ? 'You: ' : 'Galadrial: ') + text;
       log.appendChild(div);
       log.scrollTop = log.scrollHeight;
+      if (sender === 'assistant' && !isError) speak(text);
     }
 
     form.addEventListener('submit', async (e) => {
@@ -266,6 +418,108 @@ def get_client_html() -> str:
         sendBtn.disabled = false;
       }
     });
+
+    // --- Voice input: browser records audio, server transcribes with Whisper ---
+    let mediaRecorder = null;
+    let micStream = null;
+    let audioChunks = [];
+    let currentMimeType = '';
+
+    function _pickMimeType() {
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg',
+      ];
+      for (const c of candidates) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(c)) return c;
+      }
+      return '';
+    }
+
+    async function _transcribeBlob(blob, mimeType) {
+      const fd = new FormData();
+      const ext = mimeType && mimeType.toLowerCase().includes('ogg') ? 'ogg' : 'webm';
+      fd.append('file', blob, `mic.${ext}`);
+      const r = await fetch('/stt', { method: 'POST', body: fd });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || r.statusText || 'STT failed');
+      return (data.transcript || '').trim();
+    }
+
+    async function _startRecording() {
+      input.value = '';
+      micBtn.disabled = true;
+      sendBtn.disabled = true;
+      micBtn.textContent = 'Listening...';
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStream = stream;
+      audioChunks = [];
+      currentMimeType = _pickMimeType();
+      const options = {};
+      if (currentMimeType) options.mimeType = currentMimeType;
+
+      mediaRecorder = new MediaRecorder(stream, options);
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+      mediaRecorder.onstop = async () => {
+        try {
+          if (micStream) micStream.getTracks().forEach((t) => t.stop());
+
+          const blob = new Blob(audioChunks, { type: currentMimeType || 'audio/webm' });
+          micBtn.textContent = 'Mic';
+          micBtn.disabled = false;
+          sendBtn.disabled = false;
+
+          if (!blob.size) return;
+          append('assistant', 'Transcribing...', false);
+          const transcript = await _transcribeBlob(blob, currentMimeType);
+          if (!transcript) return;
+          input.value = transcript;
+          if (input.value.trim()) {
+            form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+          }
+        } catch (e) {
+          micBtn.textContent = 'Mic';
+          micBtn.disabled = false;
+          sendBtn.disabled = false;
+          append('assistant', 'Mic transcription failed: ' + ((e && e.message) ? e.message : String(e)), true);
+        } finally {
+          mediaRecorder = null;
+          micStream = null;
+          audioChunks = [];
+          currentMimeType = '';
+        }
+      };
+
+      mediaRecorder.start();
+      micBtn.disabled = false;
+      micBtn.textContent = 'Stop';
+    }
+
+    if (micBtn && window.MediaRecorder) {
+      micBtn.addEventListener('click', async () => {
+        try {
+          if (mediaRecorder && mediaRecorder.state === 'recording') {
+            micBtn.disabled = true;
+            mediaRecorder.stop();
+            return;
+          }
+          await _startRecording();
+        } catch (e) {
+          micBtn.textContent = 'Mic';
+          micBtn.disabled = false;
+          sendBtn.disabled = false;
+          append('assistant', 'Mic start failed: ' + ((e && e.message) ? e.message : String(e)), true);
+        }
+      });
+    } else if (micBtn) {
+      micBtn.disabled = true;
+      micBtn.textContent = 'Mic (unsupported)';
+    }
   </script>
 </body>
 </html>
@@ -352,38 +606,98 @@ def get_dnd_html() -> str:
     const transcript = document.getElementById('transcript');
     const replyEl = document.getElementById('reply');
 
-    let recognition = null;
-    let finalTranscript = '';
+    // Whisper STT: browser records audio, server transcribes, then we fill the editable textarea.
+    let mediaRecorder = null;
+    let micStream = null;
+    let audioChunks = [];
+    let currentMimeType = '';
 
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      recognition = new SR();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.onresult = (e) => {
-        let interim = '';
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          if (e.results[i].isFinal) finalTranscript += e.results[i][0].transcript + ' ';
-          else interim += e.results[i][0].transcript;
+    function _pickMimeType() {
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg',
+      ];
+      for (const c of candidates) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(c)) return c;
+      }
+      return '';
+    }
+
+    async function _transcribeBlob(blob, mimeType) {
+      const fd = new FormData();
+      const ext = mimeType && mimeType.toLowerCase().includes('ogg') ? 'ogg' : 'webm';
+      fd.append('file', blob, `mic.${ext}`);
+      const r = await fetch('/stt', { method: 'POST', body: fd });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || r.statusText || 'STT failed');
+      return (data.transcript || '').trim();
+    }
+
+    if (window.MediaRecorder) {
+      recordBtn.addEventListener('click', async () => {
+        try {
+          recordBtn.disabled = true;
+          stopBtn.disabled = false;
+          replyEl.textContent = 'Recording...';
+          replyEl.classList.remove('empty');
+          replyEl.classList.remove('error');
+
+          transcript.value = transcript.value || '';
+          audioChunks = [];
+          currentMimeType = _pickMimeType();
+
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          micStream = stream;
+          const options = {};
+          if (currentMimeType) options.mimeType = currentMimeType;
+          mediaRecorder = new MediaRecorder(stream, options);
+          mediaRecorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) audioChunks.push(e.data);
+          };
+          mediaRecorder.onstop = async () => {
+            try {
+              if (micStream) micStream.getTracks().forEach((t) => t.stop());
+              const blob = new Blob(audioChunks, { type: currentMimeType || 'audio/webm' });
+              replyEl.textContent = 'Transcribing...';
+              if (!blob.size) return;
+              const text = await _transcribeBlob(blob, currentMimeType);
+              transcript.value = text;
+              replyEl.textContent = 'Transcript ready.';
+              replyEl.classList.remove('error');
+            } catch (e) {
+              replyEl.textContent = 'Transcription failed: ' + ((e && e.message) ? e.message : String(e));
+              replyEl.classList.add('error');
+            } finally {
+              recordBtn.disabled = false;
+              stopBtn.disabled = true;
+              mediaRecorder = null;
+              micStream = null;
+              audioChunks = [];
+              currentMimeType = '';
+            }
+          };
+
+          mediaRecorder.start();
+        } catch (e) {
+          recordBtn.disabled = false;
+          stopBtn.disabled = true;
+          replyEl.textContent = 'Mic start failed: ' + ((e && e.message) ? e.message : String(e));
+          replyEl.classList.add('error');
         }
-        transcript.value = finalTranscript + interim;
-      };
-      recognition.onend = () => { recordBtn.disabled = false; stopBtn.disabled = true; }
+      });
+
+      stopBtn.addEventListener('click', () => {
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+          mediaRecorder.stop();
+        }
+      });
     } else {
       recordBtn.textContent = 'Record (unsupported)';
       recordBtn.disabled = true;
+      stopBtn.disabled = true;
     }
-
-    recordBtn.addEventListener('click', () => {
-      if (!recognition) return;
-      finalTranscript = transcript.value.trim() + (transcript.value ? ' ' : '');
-      recognition.start();
-      recordBtn.disabled = true;
-      stopBtn.disabled = false;
-    });
-    stopBtn.addEventListener('click', () => {
-      if (recognition) recognition.stop();
-    });
 
     sendBtn.addEventListener('click', async () => {
       const text = transcript.value.trim();

@@ -836,6 +836,11 @@ Previous routed action (JSON or null):
             # Give the model safe context about what is and is not under its control
             system_preamble = (
                 "You are Galadrial, an AI assistant embedded in a desktop GUI.\n\n"
+                "- IMPORTANT OUTPUT FORMAT: Output plain text only (no markdown, no code fences)."
+                " Use ASCII characters only. Do not use emojis or decorative symbols,"
+                " and avoid bullet points or special typographic punctuation."
+                " When you write your reply, use normal sentences; do not start any line"
+                " with '-' or '•'.\n"
                 "- The app can control my Govee lights via an API. When you see a "
                 "system note telling you that the lights were set to a state, you may "
                 "speak as if that action has already been performed.\n"
