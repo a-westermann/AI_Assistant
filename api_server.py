@@ -475,7 +475,6 @@ def get_client_html() -> str:
           sendBtn.disabled = false;
 
           if (!blob.size) return;
-          append('assistant', 'Transcribing...', false);
           const transcript = await _transcribeBlob(blob, currentMimeType);
           if (!transcript) return;
           input.value = transcript;
@@ -660,7 +659,6 @@ def get_dnd_html() -> str:
             try {
               if (micStream) micStream.getTracks().forEach((t) => t.stop());
               const blob = new Blob(audioChunks, { type: currentMimeType || 'audio/webm' });
-              replyEl.textContent = 'Transcribing...';
               if (!blob.size) return;
               const text = await _transcribeBlob(blob, currentMimeType);
               transcript.value = text;

@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from typing import Any, Callable, Optional
 
 from llm import ask_lmstudio
@@ -144,6 +145,7 @@ class AssistantEngine:
         self.log = log_fn or _default_log
         self.last_route: dict | None = None
         self.last_user_message: str | None = None
+        self._profile_active: bool = False
 
     def _is_lighting_related(self, text: str) -> bool:
         t = (text or "").lower()
@@ -188,6 +190,41 @@ class AssistantEngine:
         """Detect whether the user is asking for current weather information."""
         t = (text or "").lower()
         return any(k in t for k in ("weather", "forecast", "temperature", "temp", "degree", "degrees"))
+
+    def _should_skip_tool_router(self, text: str) -> bool:
+        """
+        If the message is clearly just general chat (no lights/gmail/plex/memory actions),
+        skip the router LLM call to reduce latency.
+        """
+        t = (text or "").lower()
+        tool_triggers = (
+            "lights",
+            "light",
+            "nanoleaf",
+            "govee",
+            "scene",
+            "brightness",
+            "dim",
+            "bright",
+            "cozy",
+            "warm",
+            "sexy",
+            "romantic",
+            "pulse",
+            "animation",
+            "flow",
+            "create",
+            "email",
+            "gmail",
+            "inbox",
+            "plex",
+            "sync",
+            "remember",
+            "weather",
+            "forecast",
+            "temperature",
+        )
+        return not any(k in t for k in tool_triggers)
 
     def _try_parse_remember_mapping(self, user_text: str) -> tuple[str, str] | None:
         """
@@ -642,7 +679,10 @@ Respond with JSON only:
 {{"action": "<tool name from the list above>", "params": {{...}}}}
 """
         try:
+            t0 = time.perf_counter() if self._profile_active else None
             response = ask_lmstudio(tool_choice_prompt)
+            if self._profile_active and t0 is not None:
+                self.log(f"PROFILE: router_model_call={time.perf_counter() - t0:.2f}s")
             raw = response["output"][0]["content"].strip()
             if raw.startswith("```"):
                 parts = raw.split("```")
@@ -672,42 +712,60 @@ Respond with JSON only:
             return self.last_route
         return {"action": "none", "params": {}}
 
-    def _call_model(self, prompt: str, light_action: str | None = None, extra_note: str = "") -> str:
+    def _call_model(
+        self,
+        prompt: str,
+        light_action: str | None = None,
+        extra_note: str = "",
+        *,
+        compact_system: bool = False,
+    ) -> str:
         """Build prompt, call LM Studio, return assistant reply text."""
-        system_preamble = (
-            "You are Galadrial, an AI assistant embedded in a desktop GUI.\n\n"
-            "- Your user's name is Andrew. Give short, concise responses."
-            " Always be warm and friendly.\n"
-            "- IMPORTANT OUTPUT FORMAT: Output plain text only (no markdown, no code fences)."
-            " Use ASCII characters only. Do not use emojis or decorative symbols,"
-            " and avoid bullet points or special typographic punctuation."
-            " When you write your reply, use normal sentences; do not start any line"
-            " with '-' or '•'."
-            "- The app can control my Govee lights via an API. When you see a system note telling"
-            " you that the lights were set to a state, you may speak as if that action has already"
-            " been performed.\n"
-            "- The app may also display separate System messages with the results of tools"
-            " (for example, Gmail searches, Plex sync, weather). Those System messages are the"
-            " source of truth about my real data.\n"
-            "- VERY IMPORTANT: Do NOT repeat System notes verbatim or list them like logs"
-            " (e.g. 'Lights set:', 'Weather:', 'Quick news summary:'). Instead"
-            " briefly and naturally incorporate only the important parts"
-            " into your reply, or skip details I didn't explicitly ask for.\n\n"
-            "CRITICAL SAFETY RULES:\n"
-            "- Do NOT invent or guess specific facts about my personal data or file contents.\n"
-            "- If you are not given an explicit System note or tool result that contains those"
-            " facts, you must say that you don't know instead of making something up.\n"
-            "- You may still answer general questions with your own knowledge, but never fabricate"
-            " concrete details about my life or accounts.\n\n"
-            "- Weather safety: If the user asks for the current weather, you may only state"
-            " it when you were given a System note or tool result that contains the weather."
-            " Otherwise, say you don't know.\n\n"
-            "- The user has a D&D campaign folder (notes and maps). You do not have access to it"
-            " from this chat. If they ask, say that the D&D improv feature does: when they open"
-            " http://localhost:8000/dnd in a browser (with the API server running), they can"
-            " record or paste conversation and click Get suggestion to get dialogue that uses"
-            " that folder.\n\n"
-        )
+        if compact_system:
+            system_preamble = (
+                "You are Galadrial, an AI assistant in a desktop GUI.\n"
+                "- Your user's name is Andrew. Keep replies short and friendly.\n"
+                "- IMPORTANT: Output plain ASCII text only. No markdown, no code fences, no emojis.\n"
+                "- Safety: Do NOT invent facts about personal data. If you weren't given a tool/system"
+                " result for a requested detail (like weather), say you don't know.\n"
+                "- If you are given a system note saying the app set lights/weather, you may describe it.\n"
+                "- If the user asks about D&D improv, direct them to http://localhost:8000/dnd.\n\n"
+            )
+        else:
+            system_preamble = (
+                "You are Galadrial, an AI assistant embedded in a desktop GUI.\n\n"
+                "- Your user's name is Andrew. Give short, concise responses."
+                " Always be warm and friendly.\n"
+                "- IMPORTANT OUTPUT FORMAT: Output plain text only (no markdown, no code fences)."
+                " Use ASCII characters only. Do not use emojis or decorative symbols,"
+                " and avoid bullet points or special typographic punctuation."
+                " When you write your reply, use normal sentences; do not start any line"
+                " with '-' or '•'."
+                "- The app can control my Govee lights via an API. When you see a system note telling"
+                " you that the lights were set to a state, you may speak as if that action has already"
+                " been performed.\n"
+                "- The app may also display separate System messages with the results of tools"
+                " (for example, Gmail searches, Plex sync, weather). Those System messages are the"
+                " source of truth about my real data.\n"
+                "- VERY IMPORTANT: Do NOT repeat System notes verbatim or list them like logs"
+                " (e.g. 'Lights set:', 'Weather:', 'Quick news summary:'). Instead"
+                " briefly and naturally incorporate only the important parts"
+                " into your reply, or skip details I didn't explicitly ask for.\n\n"
+                "CRITICAL SAFETY RULES:\n"
+                "- Do NOT invent or guess specific facts about my personal data or file contents.\n"
+                "- If you are not given an explicit System note or tool result that contains those"
+                " facts, you must say that you don't know instead of making something up.\n"
+                "- You may still answer general questions with your own knowledge, but never fabricate"
+                " concrete details about my life or accounts.\n\n"
+                "- Weather safety: If the user asks for the current weather, you may only state"
+                " it when you were given a System note or tool result that contains the weather."
+                " Otherwise, say you don't know.\n\n"
+                "- The user has a D&D campaign folder (notes and maps). You do not have access to it"
+                " from this chat. If they ask, say that the D&D improv feature does: when they open"
+                " http://localhost:8000/dnd in a browser (with the API server running), they can"
+                " record or paste conversation and click Get suggestion to get dialogue that uses"
+                " that folder.\n\n"
+            )
         action_note = ""
         if light_action in ("on", "off", "auto"):
             action_note = f"System note: The app has just set the lights to '{light_action}'.\n\n"
@@ -715,7 +773,10 @@ Respond with JSON only:
             action_note = action_note + extra_note
         full_prompt = f"{system_preamble}{action_note}User: {prompt}"
         try:
+            t0 = time.perf_counter() if self._profile_active else None
             response = ask_lmstudio(full_prompt)
+            if self._profile_active and t0 is not None:
+                self.log(f"PROFILE: assistant_model_call={time.perf_counter() - t0:.2f}s")
             return (response.get("output") or [{}])[0].get("content", "").strip() or "No response."
         except Exception as e:
             self.log(f"Model error: {e}")
@@ -1070,6 +1131,19 @@ Respond with JSON only:
         """
         # Hard-wired routines for wake/sleep phrases so they are stable and fast.
         t_raw = (user_text or "").lower()
+
+        # Optional micro-profiling: send "profile <message>" to print stage timings.
+        profile_prefix = "profile "
+        self._profile_active = bool(
+            os.environ.get("GALADRIAL_PROFILE", "").lower() in ("1", "true", "yes")
+            or t_raw.startswith(profile_prefix)
+        )
+        if t_raw.startswith(profile_prefix):
+            user_text = (user_text or "")[len(profile_prefix) :].strip()
+            t_raw = (user_text or "").lower()
+
+        total_t0 = time.perf_counter() if self._profile_active else None
+
         if "good morning" in t_raw:
             return self._run_morning_routine(user_text)
         if "good night" in t_raw:
@@ -1134,6 +1208,18 @@ Respond with JSON only:
                     None,
                     extra_note=extra,
                 )
+
+        # For non-lighting, non-weather, non-memory requests that are clearly just chat,
+        # skip the tool-choice router LLM call (major latency win).
+        if self._should_skip_tool_router(effective_text):
+            self.last_route = {"action": "none", "params": {}}
+            self.last_user_message = effective_text
+            if self._profile_active and total_t0 is not None:
+                self.log(f"PROFILE: router_model_call=0.00s (skipped router)")
+            reply = self._call_model(effective_text, None, compact_system=True)
+            if self._profile_active and total_t0 is not None:
+                self.log(f"PROFILE: total={time.perf_counter() - total_t0:.2f}s")
+            return reply
 
         route = self.route(effective_text)
         action = (route.get("action") or "none").lower()
@@ -1494,7 +1580,10 @@ Respond with JSON only:
                 extra_note="System note: The app has just started the Plex sync in the background and will notify when it finishes.\n\n",
             )
 
-        return self._call_model(user_text, None)
+        reply = self._call_model(user_text, None)
+        if self._profile_active and total_t0 is not None:
+            self.log(f"PROFILE: total={time.perf_counter() - total_t0:.2f}s")
+        return reply
 
 
 def handle_message(user_text: str, log_fn: Optional[Callable[[str], None]] = None) -> str:
