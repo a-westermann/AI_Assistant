@@ -22,7 +22,11 @@ from lights_client import (
 from nanoleaf import nanoleaf
 from gmail_client import search_gmail, GmailClientError
 from user_memory import remember_alias, resolve_alias
-from weather_client import get_current_weather_summary, WeatherClientError
+from weather_client import (
+    get_current_weather_summary,
+    get_day_weather_forecast_summary,
+    WeatherClientError,
+)
 
 # Plex sync (same as chat_gui; override with PLEX_SYNC_DIR env if needed)
 PLEX_SYNC_DIR = os.environ.get("PLEX_SYNC_DIR", r"H:\Coding\Python Projects\plex_sync")
@@ -189,7 +193,36 @@ class AssistantEngine:
     def _is_weather_query(self, text: str) -> bool:
         """Detect whether the user is asking for current weather information."""
         t = (text or "").lower()
-        return any(k in t for k in ("weather", "forecast", "temperature", "temp", "degree", "degrees"))
+        # "forecast"/"today"/"rain" are handled by the forecast function.
+        return any(k in t for k in ("weather", "temperature", "temp", "degree", "degrees", "right now"))
+
+    def _is_weather_forecast_query(self, text: str) -> bool:
+        """Detect day-level weather forecast questions."""
+        t = (text or "").lower()
+        # Never classify lighting/animation requests as weather just because
+        # they contain substrings like "rainbow".
+        lighting_terms = (
+            "nanoleaf",
+            "govee",
+            "govee lights",
+            "lights",
+            "light",
+            "animation",
+            "scene",
+            "brightness",
+        )
+        if any(x in t for x in lighting_terms):
+            return False
+
+        # Weather forecast signals.
+        if any(k in t for k in ("forecast", "today", "for the day", "precipitation", "precip")):
+            return True
+        if any(k in t for k in ("high", "peak", "tonight")):
+            return True
+        # "rain" should be a standalone word to avoid matching "rainbow".
+        if re.search(r"\brain\b", t):
+            return True
+        return False
 
     def _should_skip_tool_router(self, text: str) -> bool:
         """
@@ -757,9 +790,9 @@ Respond with JSON only:
                 " facts, you must say that you don't know instead of making something up.\n"
                 "- You may still answer general questions with your own knowledge, but never fabricate"
                 " concrete details about my life or accounts.\n\n"
-                "- Weather safety: If the user asks for the current weather, you may only state"
-                " it when you were given a System note or tool result that contains the weather."
-                " Otherwise, say you don't know.\n\n"
+            "- Weather safety: If the user asks about weather (current or forecast), you may only state"
+            " it when you were given a System note or tool result that contains the weather."
+            " Otherwise, say you don't know.\n\n"
                 "- The user has a D&D campaign folder (notes and maps). You do not have access to it"
                 " from this chat. If they ask, say that the D&D improv feature does: when they open"
                 " http://localhost:8000/dnd in a browser (with the API server running), they can"
@@ -1150,10 +1183,16 @@ Respond with JSON only:
             return self._run_night_routine(user_text)
 
         # Deterministic weather handling: never guess if the API fails.
+        if self._is_weather_forecast_query(user_text):
+            try:
+                return get_day_weather_forecast_summary()
+            except WeatherClientError:
+                return "I can't fetch the daily weather forecast right now. Please try again shortly."
+
         if self._is_weather_query(user_text):
             try:
                 weather = get_current_weather_summary()
-                return f"Right now: {weather}."
+                return f"Right now it is {weather}."
             except WeatherClientError:
                 return "I can't fetch the current weather right now. Please try again shortly."
 
@@ -1171,6 +1210,29 @@ Respond with JSON only:
                 user_text,
                 None,
                 extra_note=f"System note: The app has just remembered that '{key}' means '{value}'. You can acknowledge that briefly.\n\n",
+            )
+
+        # Deterministic: "auto mode" should only apply to Govee (not Nanoleaf).
+        # The structured lighting plan pipeline doesn't currently support Govee "auto" correctly.
+        t_lower = (effective_text or "").lower()
+        if (
+            ("auto" in t_lower or "automatic" in t_lower)
+            and ("govee" in t_lower or "govee lights" in t_lower or "lights" in t_lower or "light" in t_lower)
+            and "nanoleaf" not in t_lower
+        ):
+            try:
+                set_lights_auto()
+            except LightsClientError as e:
+                self.log(f"Govee auto failed: {e}")
+                return self._call_model(
+                    effective_text,
+                    None,
+                    extra_note="System note: Setting Govee to auto mode failed. Tell the user it failed and they can try again.\n\n",
+                )
+            return self._call_model(
+                effective_text,
+                None,
+                extra_note="System note: The app has just set Govee lights to auto mode. Do not change Nanoleaf.\n\n",
             )
 
         # New structured-plan pipeline for lighting requests (semantic parse -> deterministic executor).
