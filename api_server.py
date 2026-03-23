@@ -52,6 +52,15 @@ from weather_client import (
     WeatherClientError,
 )
 from auto_lighting_sync import start_auto_lighting_sync, stop_auto_lighting_sync, is_auto_lighting_sync_live
+from shopping_list_store import (
+    add_item as shopping_add_item,
+    update_item as shopping_update_item,
+    delete_item as shopping_delete_item,
+    get_items as shopping_get_items,
+    get_sort_order as shopping_get_sort_order,
+    set_sort_order as shopping_set_sort_order,
+    replace_all as shopping_replace_all,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -241,6 +250,24 @@ class WeatherUiResponse(BaseModel):
     current_desc: str
     current_icon: str
     hourly: list[dict]
+
+
+class ShoppingItemCreateRequest(BaseModel):
+    name: str
+
+
+class ShoppingItemUpdateRequest(BaseModel):
+    name: str | None = None
+    checked: bool | None = None
+    quantity: int | None = None
+
+
+class ShoppingSortOrderRequest(BaseModel):
+    reference_order: list[str]
+
+
+class ShoppingReplaceAllRequest(BaseModel):
+    items: list[dict]
 
 
 @app.post("/dnd-improv", response_model=ChatResponse)
@@ -492,6 +519,79 @@ async def weather_current():
     try:
         return WeatherResponse(summary=get_current_weather_summary())
     except WeatherClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/shopping/items")
+async def shopping_items_get():
+    try:
+        return {"items": shopping_get_items()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shopping/items")
+async def shopping_items_add(body: ShoppingItemCreateRequest):
+    try:
+        item = shopping_add_item(body.name)
+        return {"success": True, "item": item}
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="duplicate item")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/shopping/items/{item_id}")
+async def shopping_items_patch(item_id: str, body: ShoppingItemUpdateRequest):
+    try:
+        item = shopping_update_item(item_id, name=body.name, checked=body.checked, quantity=body.quantity)
+        return {"success": True, "item": item}
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="duplicate item")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="item not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/shopping/items/{item_id}")
+async def shopping_items_delete(item_id: str):
+    try:
+        shopping_delete_item(item_id)
+        return {"success": True}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="item not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/shopping/sort-order")
+async def shopping_sort_order_get():
+    try:
+        return {"reference_order": shopping_get_sort_order()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/shopping/sort-order")
+async def shopping_sort_order_put(body: ShoppingSortOrderRequest):
+    try:
+        out = shopping_set_sort_order(body.reference_order or [])
+        return {"success": True, "reference_order": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/shopping/items/replace-all")
+async def shopping_items_replace_all(body: ShoppingReplaceAllRequest):
+    try:
+        out = shopping_replace_all(body.items or [])
+        return {"success": True, "items": out}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
