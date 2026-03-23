@@ -1,9 +1,12 @@
 {
   "aliases": {
     "good morning": "Turn both the Nanoleaf and Govee lights on to a static, warm, gentle morning color at 35% brightness. Do NOT tell me about the lights or news of any kind. Instead say: 'Good morning, Andrew.' Then give me a brief summary and weather for the day.",
+    "good morning Galadrial": "Turn both the Nanoleaf and Govee lights on to a static, warm, gentle morning color at 35% brightness. Do NOT tell me about the lights or news of any kind. Instead say: 'Good morning, Andrew.' Then give me a brief summary and weather for the day.",
     "good night": "Turn off both the Nanoleaf and Govee lights and say: Goodnight, Andrew.",
+    "good night Galadrial": "Turn off both the Nanoleaf and Govee lights and say: Goodnight, Andrew.",
     "writing mode": "orange at 35% brightness. Respond with 'Lights set to writing mode.'",
     "make them dance": "custom animation for nanoleaf lights using current color scheme",
-    "night time mode": "set the nano leaf only to a dim red-orange at about 30% brightness. Respond with 'Lights set to night time mode.'"
+    "night time mode": "set the nano leaf only to a dim red-orange at about 30% brightness. Respond with 'Lights set to night time mode.'",
+    "nighttime mode": "dim orange lights"
   }
 }

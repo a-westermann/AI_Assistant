@@ -9,6 +9,10 @@ import socket
 import asyncio
 import os
 import tempfile
+import threading
+import random
+import requests
+from collections import deque
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -25,16 +29,128 @@ from dnd_loader import (
     _parse_llm_selection_response,
 )
 from llm import ask_lmstudio, ask_lmstudio_with_images
+from lights_client import (
+    toggle_all_lights,
+    set_lights_auto,
+    set_lights_style,
+    LightsClientError,
+)
+from nanoleaf.nanoleaf import (
+    turn_on,
+    turn_off,
+    set_effect,
+    set_brightness as set_nanoleaf_brightness,
+    get_scene_list,
+    get_token as get_nanoleaf_token,
+    NANOLEAF_IP,
+)
+from user_memory import resolve_alias, resolve_alias_match
+from weather_client import (
+    get_current_weather_summary,
+    get_day_weather_forecast_summary,
+    get_weather_ui_payload,
+    WeatherClientError,
+)
+from auto_lighting_sync import start_auto_lighting_sync, stop_auto_lighting_sync, is_auto_lighting_sync_live
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 stt_model: WhisperModel | None = None
 stt_lock = asyncio.Lock()
+_async_failures: deque[str] = deque(maxlen=20)
+_async_failures_lock = threading.Lock()
 
 
 def _log_event(msg: str) -> None:
     logger.info(msg)
+
+
+def _looks_like_lighting_action_text(text: str) -> bool:
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+    # Let full wake/sleep routines run normally (they include greeting/weather behavior).
+    if "good morning" in t or "good night" in t:
+        return False
+    if "remember " in t and ("means" in t or "i mean" in t or "when i say" in t):
+        # Explicit memory-writing commands should not become background light actions.
+        return False
+    device_words = ("light", "lights", "govee", "nanoleaf", "scene", "brightness", "color")
+    command_words = ("turn", "set", "make", "dim", "bright", "scene", "auto", "off", "on", "pulse", "animation")
+    return any(w in t for w in device_words) and any(w in t for w in command_words)
+
+
+def _looks_like_background_lighting_action(message: str) -> tuple[bool, str | None]:
+    """Detect direct light commands OR alias phrases that expand to light commands."""
+    raw = (message or "").strip()
+    if not raw:
+        return False, None
+    if _looks_like_lighting_action_text(raw):
+        return True, None
+    match = resolve_alias_match(raw)
+    expanded = match[1] if match else resolve_alias(raw)
+    if expanded and ("good morning" in expanded.lower() or "good night" in expanded.lower()):
+        return False, None
+    if expanded and expanded != raw and _looks_like_lighting_action_text(expanded):
+        matched_key = match[0] if match else None
+        return True, matched_key
+    return False, None
+
+
+_LIGHT_ACK_VARIANTS = [
+    "Got it, I'll adjust the lights for you.",
+    "Sounds good. I'll handle the lighting now.",
+    "On it, updating the lights now.",
+    "Absolutely. I'll set that lighting change now.",
+    "Great, I'll take care of the lights.",
+    "Understood. I'll adjust the lighting right away.",
+    "Perfect, I'll update the lights now.",
+    "Got it. I'll make that lighting change.",
+]
+
+
+def _ack_for_lighting_action() -> str:
+    return random.choice(_LIGHT_ACK_VARIANTS)
+
+
+def _ack_for_lighting_action_with_context(message: str, alias_key: str | None) -> str:
+    if alias_key:
+        return f"Updating the lights to {alias_key}."
+    return _ack_for_lighting_action()
+
+
+def _record_async_failure(text: str) -> None:
+    with _async_failures_lock:
+        _async_failures.append(text.strip())
+
+
+def _pop_async_failure() -> str | None:
+    with _async_failures_lock:
+        if not _async_failures:
+            return None
+        return _async_failures.popleft()
+
+
+def _run_background_action(message: str) -> None:
+    """Run a command in background; record only failures."""
+    try:
+        reply = handle_message(message, log_fn=_log_event) or ""
+        low = reply.lower()
+        # Keep this conservative: only queue obvious failure responses.
+        if any(x in low for x in ("failed", "error", "sorry")):
+            _record_async_failure(reply)
+    except Exception as e:
+        logger.exception("Background action failed")
+        _record_async_failure(f"I tried to run that command but it failed: {e}")
+
+
+def _sanitize_app_reply(reply: str) -> str:
+    """Hide internal LLM transport errors from app clients."""
+    text = (reply or "").strip()
+    if text.lower().startswith("error calling model:"):
+        return "Sorry, the AI is not in right now."
+    return text
 
 
 def _lan_ips() -> list[str]:
@@ -76,6 +192,7 @@ app = FastAPI(title="Galadrial API", lifespan=lifespan)
 
 class ChatRequest(BaseModel):
     message: str
+    user_name: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -88,6 +205,42 @@ class DndImprovRequest(BaseModel):
 
 class SttResponse(BaseModel):
     transcript: str
+
+
+class GoveeStateRequest(BaseModel):
+    state: str
+
+
+class GoveeBrightnessRequest(BaseModel):
+    brightness: int
+
+
+class GoveeTemperatureRequest(BaseModel):
+    temperature_k: int
+
+
+class NanoleafStateRequest(BaseModel):
+    state: str
+
+
+class NanoleafSceneRequest(BaseModel):
+    scene: str
+
+
+class NanoleafBrightnessRequest(BaseModel):
+    brightness: int
+
+
+class WeatherResponse(BaseModel):
+    summary: str
+
+
+class WeatherUiResponse(BaseModel):
+    location: str
+    current_temp_f: int | None
+    current_desc: str
+    current_icon: str
+    hourly: list[dict]
 
 
 @app.post("/dnd-improv", response_model=ChatResponse)
@@ -215,6 +368,158 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/lights/nanoleaf/scenes")
+async def nanoleaf_scenes():
+    """Return available Nanoleaf scene names from scenes.txt."""
+    try:
+        scenes = [s for s in get_scene_list() if s and not s.strip().startswith("#")]
+        return {"scenes": scenes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/lights/govee/state")
+async def lights_govee_state(body: GoveeStateRequest):
+    try:
+        stop_auto_lighting_sync(log_fn=_log_event)
+        state = (body.state or "").strip().lower()
+        if state not in ("on", "off"):
+            raise HTTPException(status_code=400, detail="state must be 'on' or 'off'")
+        return toggle_all_lights(state)  # type: ignore[arg-type]
+    except LightsClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/lights/govee/auto")
+async def lights_govee_auto():
+    try:
+        return start_auto_lighting_sync(log_fn=_log_event)
+    except LightsClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/lights/auto/status")
+async def lights_auto_status():
+    """Return whether backend Nanoleaf auto-sync worker is currently running."""
+    return {"success": True, "auto_sync_live": is_auto_lighting_sync_live()}
+
+
+@app.post("/lights/govee/brightness")
+async def lights_govee_brightness(body: GoveeBrightnessRequest):
+    try:
+        stop_auto_lighting_sync(log_fn=_log_event)
+        brightness = max(0, min(100, int(body.brightness)))
+        return set_lights_style(state="on", brightness=brightness)
+    except LightsClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/lights/govee/temperature")
+async def lights_govee_temperature(body: GoveeTemperatureRequest):
+    try:
+        stop_auto_lighting_sync(log_fn=_log_event)
+        temperature_k = max(1000, min(10000, int(body.temperature_k)))
+        return set_lights_style(state="on", color_temp_k=temperature_k)
+    except LightsClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/lights/nanoleaf/state")
+async def lights_nanoleaf_state(body: NanoleafStateRequest):
+    state = (body.state or "").strip().lower()
+    if state not in ("on", "off"):
+        raise HTTPException(status_code=400, detail="state must be 'on' or 'off'")
+    try:
+        if state == "on":
+            turn_on()
+        else:
+            turn_off()
+        return {"success": True, "state": state}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/lights/nanoleaf/scene")
+async def lights_nanoleaf_scene(body: NanoleafSceneRequest):
+    stop_auto_lighting_sync(log_fn=_log_event)
+    scene = (body.scene or "").strip()
+    if not scene:
+        raise HTTPException(status_code=400, detail="scene must be non-empty")
+    try:
+        set_effect(scene)
+        return {"success": True, "scene": scene}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/lights/nanoleaf/brightness")
+async def lights_nanoleaf_brightness(body: NanoleafBrightnessRequest):
+    try:
+        level = max(0, min(100, int(body.brightness)))
+        set_nanoleaf_brightness(level)
+        return {"success": True, "brightness": level}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/lights/nanoleaf/status")
+async def lights_nanoleaf_status():
+    """Read Nanoleaf on/off and brightness from device state API."""
+    try:
+        token = get_nanoleaf_token()
+        url = f"http://{NANOLEAF_IP}:16021/api/v1/{token}/state"
+        resp = requests.get(url, timeout=5)
+        if not resp.ok:
+            raise HTTPException(status_code=500, detail=f"Nanoleaf status HTTP {resp.status_code}")
+        parsed = resp.json()
+        data = parsed if isinstance(parsed, dict) else {}
+        on_val = ((data.get("on") or {}).get("value"))
+        bri_val = ((data.get("brightness") or {}).get("value"))
+        state = "on" if bool(on_val) else "off"
+        brightness = int(bri_val) if isinstance(bri_val, (int, float)) else None
+        return {"success": True, "state": state, "brightness": brightness}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/weather/current", response_model=WeatherResponse)
+async def weather_current():
+    """Current weather summary from Open-Meteo wrapper."""
+    try:
+        return WeatherResponse(summary=get_current_weather_summary())
+    except WeatherClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/weather/forecast", response_model=WeatherResponse)
+async def weather_forecast():
+    """Today forecast summary (peak temp/time + rain likelihood)."""
+    try:
+        return WeatherResponse(summary=get_day_weather_forecast_summary())
+    except WeatherClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/weather/ui", response_model=WeatherUiResponse)
+async def weather_ui():
+    """Structured weather payload for mobile weather tab UI."""
+    try:
+        payload = get_weather_ui_payload(hours=12)
+        return WeatherUiResponse(
+            location=str(payload.get("location") or ""),
+            current_temp_f=payload.get("current_temp_f"),
+            current_desc=str(payload.get("current_desc") or ""),
+            current_icon=str(payload.get("current_icon") or "mixed"),
+            hourly=list(payload.get("hourly") or []),
+        )
+    except WeatherClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest):
     """Send a message, get the assistant's reply. Runs routing + tools + LLM on this PC."""
@@ -222,7 +527,28 @@ async def chat(body: ChatRequest):
     if not message:
         raise HTTPException(status_code=400, detail="message must be non-empty")
     try:
-        reply = handle_message(message, log_fn=_log_event)
+        # For lighting actions (including alias phrases that expand to light commands):
+        # acknowledge immediately, run in background,
+        # and avoid completion chatter unless there is a failure.
+        is_bg_light, alias_key = _looks_like_background_lighting_action(message)
+        if is_bg_light:
+            threading.Thread(
+                target=_run_background_action,
+                args=(message,),
+                daemon=True,
+                name="galadrial-bg-action",
+            ).start()
+            return ChatResponse(reply=_ack_for_lighting_action_with_context(message, alias_key))
+
+        effective_name = (body.user_name or "").strip() or "Guest"
+        reply = handle_message(message, log_fn=_log_event, user_name=effective_name)
+        pending_failure = _pop_async_failure()
+        if pending_failure:
+            if reply:
+                reply = f"{pending_failure}\n\n{reply}"
+            else:
+                reply = pending_failure
+        reply = _sanitize_app_reply(reply or "")
         return ChatResponse(reply=reply or "No response.")
     except Exception as e:
         logger.exception("Chat failed")

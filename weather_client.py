@@ -189,3 +189,133 @@ def get_day_weather_forecast_summary(rain_probability_threshold: float = 50.0) -
         f"The wettest part should peak around {peak_rain_time} (about {peak_rain_pp:.0f}%)."
     )
 
+
+def _weather_code_description(code: int | None) -> str:
+    return {
+        0: "Clear",
+        1: "Mainly clear",
+        2: "Partly cloudy",
+        3: "Overcast",
+        45: "Fog",
+        48: "Fog",
+        51: "Light drizzle",
+        53: "Drizzle",
+        55: "Heavy drizzle",
+        61: "Light rain",
+        63: "Rain",
+        65: "Heavy rain",
+        71: "Light snow",
+        73: "Snow",
+        75: "Heavy snow",
+    }.get(code, "Mixed")
+
+
+def _weather_code_icon_key(code: int | None) -> str:
+    if code in (0, 1):
+        return "clear"
+    if code in (2, 3, 45, 48):
+        return "cloud"
+    if code in (51, 53, 55, 61, 63, 65):
+        return "rain"
+    if code in (71, 73, 75):
+        return "snow"
+    return "mixed"
+
+
+def get_weather_ui_payload(hours: int = 12) -> Dict[str, Any]:
+    """
+    Structured weather payload for UI rendering.
+    Includes current conditions + next hourly points.
+    """
+    lat, lon = _get_coords()
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&current_weather=true"
+        "&hourly=temperature_2m,precipitation_probability,weathercode"
+        "&forecast_days=1"
+        "&timezone=auto"
+    )
+    try:
+        resp = requests.get(url, timeout=8)
+    except Exception as e:
+        raise WeatherClientError(f"Weather UI request failed: {e}") from e
+    if not resp.ok:
+        raise WeatherClientError(f"Weather UI HTTP {resp.status_code}: {resp.text[:200]}")
+    try:
+        data: Dict[str, Any] = resp.json()
+    except Exception as e:
+        raise WeatherClientError(f"Bad weather UI JSON: {e}") from e
+
+    cw = data.get("current_weather") or {}
+    current_temp_c = cw.get("temperature")
+    current_code = cw.get("weathercode")
+    current_time = cw.get("time")
+    current_temp_f = (
+        int(round(current_temp_c * 9.0 / 5.0 + 32.0))
+        if isinstance(current_temp_c, (int, float))
+        else None
+    )
+
+    hourly = data.get("hourly") or {}
+    times: List[str] = hourly.get("time") or []
+    temps_c: List[Any] = hourly.get("temperature_2m") or []
+    precip: List[Any] = hourly.get("precipitation_probability") or []
+    codes: List[Any] = hourly.get("weathercode") or []
+
+    if not (times and temps_c and precip and codes):
+        raise WeatherClientError("Weather UI payload missing hourly fields.")
+
+    # Start from "now" (or nearest future hourly point), not midnight.
+    start_idx = 0
+    now_dt = None
+    if isinstance(current_time, str):
+        try:
+            now_dt = _parse_time_iso(current_time)
+        except Exception:
+            now_dt = None
+    if now_dt is not None:
+        for i, t_iso in enumerate(times):
+            try:
+                if _parse_time_iso(t_iso) >= now_dt:
+                    start_idx = i
+                    break
+            except Exception:
+                continue
+    elif isinstance(current_time, str) and current_time in times:
+        # Exact fallback for any payloads that already align exactly.
+        start_idx = times.index(current_time)
+
+    points: List[Dict[str, Any]] = []
+    end_idx = min(len(times), start_idx + max(1, int(hours)))
+    for i in range(start_idx, end_idx):
+        t_iso = times[i]
+        try:
+            dt = _parse_time_iso(t_iso)
+            time_label = _format_time_local(dt)
+        except Exception:
+            time_label = t_iso[-5:]
+
+        t_c = temps_c[i]
+        t_f = int(round(t_c * 9.0 / 5.0 + 32.0)) if isinstance(t_c, (int, float)) else None
+        p = precip[i]
+        p_pct = int(round(float(p))) if isinstance(p, (int, float)) else 0
+        code_i = codes[i] if isinstance(codes[i], int) else None
+
+        points.append(
+            {
+                "time": time_label,
+                "temp_f": t_f,
+                "precip_pct": p_pct,
+                "icon": _weather_code_icon_key(code_i),
+            }
+        )
+
+    return {
+        "location": "St. Charles",
+        "current_temp_f": current_temp_f,
+        "current_desc": _weather_code_description(current_code if isinstance(current_code, int) else None),
+        "current_icon": _weather_code_icon_key(current_code if isinstance(current_code, int) else None),
+        "hourly": points,
+    }
+

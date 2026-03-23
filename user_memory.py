@@ -103,3 +103,38 @@ def resolve_alias(phrase: str) -> str | None:
 
     return None
 
+
+def resolve_alias_match(phrase: str) -> tuple[str, str] | None:
+    """
+    Return (matched_alias_key, expansion) for a phrase, if any.
+
+    Matching behavior mirrors resolve_alias():
+    - exact match first
+    - then longest prefix/substring alias key
+    """
+    text = (phrase or "").strip().lower()
+    if not text:
+        return None
+    aliases = _memory.get("aliases") or {}
+
+    # Exact match first
+    val = aliases.get(text)
+    if isinstance(val, str) and val.strip():
+        return text, val
+
+    # Prefix or substring match: prefer longest key
+    best_key = None
+    for key in aliases.keys():
+        k = str(key).strip().lower()
+        if not k:
+            continue
+        if text.startswith(k) or f" {k} " in f" {text} ":
+            if best_key is None or len(k) > len(best_key):
+                best_key = k
+    if best_key:
+        val = aliases.get(best_key)
+        if isinstance(val, str) and val.strip():
+            return best_key, val
+
+    return None
+

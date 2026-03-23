@@ -66,11 +66,120 @@ def get_lights_state() -> dict[str, Any]:
         raise LightsClientError(f"Lights API error: {data}")
 
     # Support both {"state": "on"|"off"} and {"lights_on": true|false}
+    state: str | None = None
     if "state" in data and data["state"] in ("on", "off"):
-        return {"state": data["state"], "success": True}
-    if "lights_on" in data:
-        return {"state": "on" if data["lights_on"] else "off", "success": True}
-    raise LightsClientError(f"Lights API did not return state: {data}")
+        state = str(data["state"])
+    elif "lights_on" in data:
+        state = "on" if data["lights_on"] else "off"
+
+    if state is None:
+        raise LightsClientError(f"Lights API did not return state: {data}")
+
+    def _coerce_int(v: Any) -> int | None:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            try:
+                return int(v)
+            except Exception:
+                return None
+        if isinstance(v, str):
+            vv = v.strip()
+            if vv.isdigit():
+                try:
+                    return int(vv)
+                except Exception:
+                    return None
+        if isinstance(v, dict):
+            for kk in ("value", "current", "brightness", "percent", "brightnessPercent"):
+                if kk in v:
+                    return _coerce_int(v.get(kk))
+        return None
+
+    # Optional: brightness (many status payloads include it, sometimes nested).
+    brightness: int | None = None
+    for k in (
+        "brightness",
+        "brightness_level",
+        "current_brightness",
+        "currentBrightness",
+        "brightnessPercent",
+        "brightness_percent",
+        "dimming",
+        "dimmer",
+    ):
+        if k in data:
+            b = _coerce_int(data.get(k))
+            if b is not None:
+                brightness = max(0, min(100, b))
+                break
+
+    # Optional: mode (auto vs manual).
+    mode: str | None = None
+    for k in (
+        "mode",
+        "current_mode",
+        "controlMode",
+        "lightingMode",
+        "workMode",
+        "lighting_mode",
+        "effect_mode",
+    ):
+        if k in data and isinstance(data.get(k), str):
+            mode = data.get(k)
+            break
+    if mode is None:
+        for k in ("auto", "automatic", "is_auto", "isAuto"):
+            if k in data:
+                v = data.get(k)
+                if isinstance(v, bool) and v:
+                    mode = "auto"
+                    break
+
+    # Optional: color information (depends on your status endpoint schema).
+    color_hex: str | None = None
+    for k in ("color", "color_hex", "colorHex", "colorCode", "colorCodeHex"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip().startswith("#"):
+            color_hex = v.strip()
+            break
+        if isinstance(v, dict):
+            # e.g. {"hex":"#FFFFFF"} or {"value":"#FFFFFF"}
+            for kk in ("hex", "value", "color"):
+                vv = v.get(kk) if isinstance(v, dict) else None
+                if isinstance(vv, str) and vv.strip().startswith("#"):
+                    color_hex = vv.strip()
+                    break
+        if color_hex:
+            break
+
+    # Optional: color temperature (Kelvin) if present.
+    color_temp_k: int | None = None
+    for k in (
+        "color_temp_k",
+        "colorTempK",
+        "colorTemp",
+        "temperature",
+        "color_temperature",
+        "colorTemperature",
+    ):
+        if k in data:
+            ct = _coerce_int(data.get(k))
+            if ct is not None:
+                # Clamp to plausible warm/cool LED range.
+                color_temp_k = max(0, min(20000, ct))
+                break
+
+    out: dict[str, Any] = {"state": state, "success": True}
+    if brightness is not None:
+        out["brightness"] = brightness
+    if mode is not None:
+        out["mode"] = mode
+    if color_hex is not None:
+        out["color_hex"] = color_hex
+    if color_temp_k is not None:
+        out["color_temp_k"] = color_temp_k
+    return out
 
 
 def toggle_all_lights(state: State) -> dict[str, Any]:
