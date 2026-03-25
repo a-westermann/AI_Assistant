@@ -1,3 +1,76 @@
 {
-  "items": []
+  "items": [
+    {
+      "id": "66fe09f5-85f3-489a-9309-4f13ca61e831",
+      "name": "strawberries",
+      "normalized_name": "strawberries",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-25T21:14:34.477459+00:00",
+      "updated_at": "2026-03-25T21:14:34.477459+00:00"
+    },
+    {
+      "id": "83cb5f04-b3d8-4f2c-8e93-d1b773f5f858",
+      "name": "raspberries",
+      "normalized_name": "raspberries",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-23T23:25:07.433437+00:00",
+      "updated_at": "2026-03-23T23:25:07.433437+00:00"
+    },
+    {
+      "id": "8cec2df8-c900-447e-98d9-ce5351ceea1d",
+      "name": "lettuce",
+      "normalized_name": "lettuce",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-25T21:17:47.224333+00:00",
+      "updated_at": "2026-03-25T21:17:47.224333+00:00"
+    },
+    {
+      "id": "01340d90-efe6-4fb8-9075-0600aadb7b20",
+      "name": "bread",
+      "normalized_name": "bread",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-25T21:15:19.770536+00:00",
+      "updated_at": "2026-03-25T21:15:19.770536+00:00"
+    },
+    {
+      "id": "a70b6433-f73f-4e26-b230-712d2295874e",
+      "name": "hotdog buns",
+      "normalized_name": "hotdog buns",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-25T21:15:05.829537+00:00",
+      "updated_at": "2026-03-25T21:15:05.829537+00:00"
+    },
+    {
+      "id": "a733ab07-08ce-4ad2-b1cd-e751d0855049",
+      "name": "bbq sauce",
+      "normalized_name": "bbq sauce",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-25T21:16:15.153972+00:00",
+      "updated_at": "2026-03-25T21:16:15.153972+00:00"
+    },
+    {
+      "id": "2749e023-5ae6-4aef-b41a-6138680ab61e",
+      "name": "brats",
+      "normalized_name": "brats",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-25T21:14:44.999702+00:00",
+      "updated_at": "2026-03-25T21:18:26.638637+00:00"
+    },
+    {
+      "id": "dd140bc9-8a9a-40de-896a-7b6ef9f79616",
+      "name": "charcoal",
+      "normalized_name": "charcoal",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-25T21:18:49.351685+00:00",
+      "updated_at": "2026-03-25T21:18:49.351685+00:00"
+    }
+  ]
 }

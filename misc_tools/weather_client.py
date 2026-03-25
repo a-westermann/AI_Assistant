@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -102,7 +102,10 @@ def _format_time_local(dt: datetime) -> str:
     return f"{hour12}:{minute} {ampm}"
 
 
-def get_day_weather_forecast_summary(rain_probability_threshold: float = 50.0) -> str:
+def get_day_weather_forecast_summary(
+    day_offset: int = 0,
+    rain_probability_threshold: float = 50.0,
+) -> str:
     """
     Fetch a concise day forecast using Open-Meteo (no API key).
 
@@ -110,12 +113,31 @@ def get_day_weather_forecast_summary(rain_probability_threshold: float = 50.0) -
     - whether rain is likely
     - today's temperature high and when it peaks
     """
+    day_offset = int(day_offset or 0)
+    max_offset = 14
+    if day_offset < 0:
+        day_offset = 0
+    if day_offset > max_offset:
+        raise WeatherClientError(
+            f"Requested date is {day_offset} days away; I can only forecast up to {max_offset} days ahead."
+        )
+    # User-facing label: prefer natural language weekdays over "Day +N".
+    # Keep "Today"/"Tomorrow" for clarity, otherwise show the target weekday.
+    now_date = datetime.now().date()
+    target_date = now_date + timedelta(days=day_offset)
+    if day_offset == 0:
+        day_label = "Today"
+    elif day_offset == 1:
+        day_label = "Tomorrow"
+    else:
+        day_label = target_date.strftime("%A")
+
     lat, lon = _get_coords()
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
-        "&hourly=temperature_2m,precipitation_probability"
-        "&forecast_days=1"
+        "&hourly=temperature_2m,precipitation_probability,windspeed_10m"
+        f"&forecast_days={max(1, day_offset + 1)}"
         "&timezone=auto"
     )
 
@@ -136,25 +158,32 @@ def get_day_weather_forecast_summary(rain_probability_threshold: float = 50.0) -
     times: List[str] = hourly.get("time") or []
     temps_c: List[Any] = hourly.get("temperature_2m") or []
     pp: List[Any] = hourly.get("precipitation_probability") or []
+    wind_kmh: List[Any] = hourly.get("windspeed_10m") or []
 
-    if not (times and temps_c and pp) or not (len(times) == len(temps_c) == len(pp)):
+    if not (times and temps_c and pp and wind_kmh) or not (
+        len(times) == len(temps_c) == len(pp) == len(wind_kmh)
+    ):
         raise WeatherClientError("Weather forecast missing hourly fields.")
 
     d0 = _parse_time_iso(times[0]).date()
+    target_date = d0 + timedelta(days=day_offset)
 
-    today_indices = []
+    day_indices: list[int] = []
     for i, t in enumerate(times):
         try:
-            if _parse_time_iso(t).date() == d0:
-                today_indices.append(i)
+            if _parse_time_iso(t).date() == target_date:
+                day_indices.append(i)
         except Exception:
             continue
 
-    if not today_indices:
-        raise WeatherClientError("Weather forecast had no hourly points for today.")
+    if not day_indices:
+        raise WeatherClientError(f"Weather forecast had no hourly points for {day_label.lower()}.")
 
     # Temperature high and time of peak (max temp).
-    best_i = max(today_indices, key=lambda i: temps_c[i] if isinstance(temps_c[i], (int, float)) else -1e9)
+    best_i = max(
+        day_indices,
+        key=lambda i: temps_c[i] if isinstance(temps_c[i], (int, float)) else -1e9,
+    )
     best_temp_c = temps_c[best_i]
     best_temp_f = best_temp_c * 9.0 / 5.0 + 32.0
     best_time = _format_time_local(_parse_time_iso(times[best_i]))
@@ -162,12 +191,26 @@ def get_day_weather_forecast_summary(rain_probability_threshold: float = 50.0) -
     # Rain probability window and peak time.
     rain_indices = [
         i
-        for i in today_indices
+        for i in day_indices
         if isinstance(pp[i], (int, float)) and pp[i] >= rain_probability_threshold
     ]
 
+    # Wind summary for the requested day.
+    peak_wind_i = max(
+        day_indices,
+        key=lambda i: wind_kmh[i] if isinstance(wind_kmh[i], (int, float)) else -1e9,
+    )
+    peak_wind = wind_kmh[peak_wind_i]
+    peak_wind_time = _format_time_local(_parse_time_iso(times[peak_wind_i]))
+    wind_sentence = ""
+    if isinstance(peak_wind, (int, float)):
+        wind_sentence = f" Peak wind should be around {peak_wind:.0f} km/h near {peak_wind_time}."
+
     if not rain_indices:
-        return f"Today should reach a high of {best_temp_f:.0f} degrees around {best_time}. Rain doesn't look likely."
+        return (
+            f"{day_label} should reach a high of {best_temp_f:.0f} degrees around {best_time}. "
+            f"Rain doesn't look likely.{wind_sentence}"
+        )
 
     rain_start_i = min(rain_indices)
     rain_end_i = max(rain_indices)
@@ -184,9 +227,10 @@ def get_day_weather_forecast_summary(rain_probability_threshold: float = 50.0) -
         rain_window = f"from {rain_start_time} to {rain_end_time}"
 
     return (
-        f"Today should reach a high of {best_temp_f:.0f} degrees around {best_time}. "
+        f"{day_label} should reach a high of {best_temp_f:.0f} degrees around {best_time}. "
         f"Rain is likely {rain_window}. "
         f"The wettest part should peak around {peak_rain_time} (about {peak_rain_pp:.0f}%)."
+        f"{wind_sentence}"
     )
 
 

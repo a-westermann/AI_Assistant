@@ -1,7 +1,11 @@
 import os
+import time
 import colorsys
 
 import requests
+
+# Last create_flow_effect attempt (read by API /chat and /lights/diagnostic).
+_last_flow_attempt: dict | None = None
 
 NANOLEAF_IP = "192.168.0.188"
 TOKEN_FILE = "token.txt"
@@ -17,6 +21,28 @@ def _token_path() -> str:
 def get_token() -> str:
     with open(_token_path(), "r", encoding="utf-8") as f:
         return f.read().strip()
+
+
+def get_last_flow_attempt() -> dict | None:
+    """Snapshot from the most recent create_flow_effect call (ok, detail, mode, color_count, time_unix)."""
+    return _last_flow_attempt
+
+
+def _set_flow_attempt(
+    ok: bool,
+    *,
+    detail: str = "",
+    color_count: int = 0,
+    mode: str = "",
+) -> None:
+    global _last_flow_attempt
+    _last_flow_attempt = {
+        "ok": ok,
+        "detail": (detail or "")[:500],
+        "color_count": color_count,
+        "mode": mode,
+        "time_unix": time.time(),
+    }
 
 
 def _put_state(payload: dict) -> requests.Response:
@@ -122,19 +148,20 @@ def _get_layout() -> dict | None:
         return None
 
 
-def _write_effect(write_payload: dict) -> bool:
-    """Send a custom effect to the device. write_payload is the inner 'write' dict. Returns True on success."""
+def _write_effect(write_payload: dict) -> tuple[bool, str]:
+    """Send a custom effect to the device. Returns (success, error_detail)."""
     token = get_token()
     url = f"http://{NANOLEAF_IP}:16021/api/v1/{token}/effects"
     try:
         resp = requests.put(url, json={"write": write_payload}, timeout=10)
         if resp.status_code in (200, 204):
-            return True
-        print("Nanoleaf write_effect failed:", resp.status_code, resp.text)
-        return False
+            return True, ""
+        err = f"HTTP {resp.status_code}: {(resp.text or '')[:400]}"
+        print("Nanoleaf write_effect failed:", err)
+        return False, err
     except Exception as e:
         print("Nanoleaf write_effect error:", e)
-        return False
+        return False, str(e)
 
 
 def _rgb_to_hsb_palette_entry(r: int, g: int, b: int) -> dict:
@@ -152,11 +179,12 @@ def create_flow_effect(colors_rgb: list[tuple[int, int, int]], speed: float = 1.
     Create and display a flowing animation that cycles through the given RGB colors on ALL panels, with looping.
     Uses the Nanoleaf REST API write effect (palette-based, loop enabled). Does not use nanoleafapi.
     - colors_rgb: list of (r, g, b) tuples, each 0-255. At least 2 colors.
-    - speed: transition speed (0.5 = fast, 2 = slow). Maps to transition/delay times.
+    - speed: 0.5 (slow) … 5.0 (fast). Higher = quicker transitions / snappier motion.
     Returns True if the effect was created and displayed, False otherwise.
     """
     if not colors_rgb or len(colors_rgb) < 2:
         print("create_flow_effect needs at least 2 colors.")
+        _set_flow_attempt(False, detail="Need at least 2 colors.", color_count=0, mode="skipped")
         return False
     rgb_list = []
     for c in colors_rgb:
@@ -169,36 +197,49 @@ def create_flow_effect(colors_rgb: list[tuple[int, int, int]], speed: float = 1.
     speed = max(0.5, min(5.0, speed))
     # Convert to HSB palette (Nanoleaf format)
     palette = [_rgb_to_hsb_palette_entry(r, g, b) for r, g, b in rgb_list]
-    # Nanoleaf API uses deciseconds (0.1s) for transTime/delayTime/frameTime. Lower speed value = faster = fewer deciseconds.
-    # speed 0.5 (fast) -> 2 ds (0.2s); speed 2 (slow) -> 12 ds (1.2s)
-    trans_ds = max(1, min(30, int(round(speed * 6))))
-    delay_ds = max(1, trans_ds // 2)
+    # transTime/delayTime: Nanoleaf's HSB "random" effects expect values in a higher range (see nanoleafapi docs ~50–100),
+    # not tiny decisecond counts — small values often make the controller reject the effect.
+    trans_min = int(max(35, min(95, 40 + (5.5 - speed) * 12)))
+    trans_max = min(120, trans_min + 18)
+    delay_min = int(max(18, trans_min * 0.45))
+    delay_max = min(90, delay_min + 20)
     turn_on()
-    # Try extended format with palette + loop (transTime/delayTime in deciseconds)
+    # HSB + animType "random" per nanoleafapi example; animData must be present as null.
     write_payload = {
         "command": "display",
         "animName": "Custom flow",
         "animType": "random",
         "colorType": "HSB",
+        "animData": None,
         "palette": palette,
-        "brightnessRange": {"minValue": 70, "maxValue": 100},
-        "transTime": {"minValue": trans_ds, "maxValue": trans_ds + 2},
-        "delayTime": {"minValue": delay_ds, "maxValue": delay_ds + 1},
+        "brightnessRange": {"minValue": 50, "maxValue": 100},
+        "transTime": {"minValue": trans_min, "maxValue": trans_max},
+        "delayTime": {"minValue": delay_min, "maxValue": delay_max},
         "loop": True,
     }
-    if _write_effect(write_payload):
+    ok_hsb, err_hsb = _write_effect(write_payload)
+    if ok_hsb:
         print("Flow effect created and displayed (looping).")
+        _set_flow_attempt(True, detail="", color_count=len(rgb_list), mode="hsb_random")
         return True
     # Fallback: try v1-style with explicit animData per panel so all panels cycle and loop
     layout = _get_layout()
     if not layout:
+        _set_flow_attempt(False, detail=err_hsb or "No layout JSON from Nanoleaf.", color_count=len(rgb_list), mode="failed")
         return False
     positions = layout.get("positionData") or []
     if not positions:
+        _set_flow_attempt(
+            False,
+            detail=(err_hsb or "") + "; empty positionData",
+            color_count=len(rgb_list),
+            mode="failed",
+        )
         return False
     # Build animData: space-separated. Per-frame format: panelId numFrames frameTime R G B transition (7 values). frameTime in deciseconds.
     panel_ids = [p["panelId"] for p in positions]
-    frame_time = trans_ds  # same decisecond value for v1 frameTime
+    # v1 custom animData: frameTime in deciseconds; map speed roughly to 4–20 ds
+    frame_time = max(4, min(25, int(round(6 + speed * 2))))
     anim_parts = []
     for panel_id in panel_ids:
         for (r, g, b) in rgb_list:
@@ -212,9 +253,17 @@ def create_flow_effect(colors_rgb: list[tuple[int, int, int]], speed: float = 1.
         "loop": True,
         "palette": [],
     }
-    if _write_effect(write_v1):
+    ok_v1, err_v1 = _write_effect(write_v1)
+    if ok_v1:
         print("Flow effect created (v1 custom, looping).")
+        _set_flow_attempt(True, detail="", color_count=len(rgb_list), mode="v1_custom")
         return True
+    _set_flow_attempt(
+        False,
+        detail=f"HSB: {err_hsb}; v1: {err_v1}",
+        color_count=len(rgb_list),
+        mode="failed",
+    )
     return False
 
 

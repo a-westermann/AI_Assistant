@@ -2,7 +2,8 @@ import json
 import os
 from typing import Any, Dict
 
-_MEMORY_PATH = os.path.join(os.path.dirname(__file__), "user_memory.json")
+_DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+_MEMORY_PATH = os.path.join(_DATA_DIR, "user_memory.json")
 
 
 def _empty() -> Dict[str, Any]:
@@ -13,7 +14,7 @@ def load_memory() -> Dict[str, Any]:
     """Load global user memory from disk (simple JSON)."""
     if not os.path.isfile(_MEMORY_PATH):
         # Fallback: if there is a fixed file, use that once to bootstrap.
-        fixed_path = os.path.join(os.path.dirname(__file__), "user_memory_fixed.json")
+        fixed_path = os.path.join(_DATA_DIR, "user_memory_fixed.json")
         if os.path.isfile(fixed_path):
             try:
                 with open(fixed_path, "r", encoding="utf-8") as f:
@@ -33,7 +34,7 @@ def load_memory() -> Dict[str, Any]:
         return data
     except Exception:
         # If the main file is corrupt, try the fixed bootstrap file once.
-        fixed_path = os.path.join(os.path.dirname(__file__), "user_memory_fixed.json")
+        fixed_path = os.path.join(_DATA_DIR, "user_memory_fixed.json")
         try:
             with open(fixed_path, "r", encoding="utf-8") as f:
                 data = json.load(f)

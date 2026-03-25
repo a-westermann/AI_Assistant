@@ -9,20 +9,21 @@ import re
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 from llm import ask_lmstudio
-from lights_client import (
+from lighting.lights_client import (
     get_lights_state,
     toggle_all_lights,
     LightsClientError,
     set_lights_auto,
     set_lights_style,
 )
-from nanoleaf import nanoleaf
-from gmail_client import search_gmail, GmailClientError
-from user_memory import remember_alias, resolve_alias
-from weather_client import (
+from lighting.nanoleaf import nanoleaf
+from misc_tools.user_memory import remember_alias, resolve_alias
+from misc_tools.weather_client import (
     get_current_weather_summary,
     get_day_weather_forecast_summary,
     WeatherClientError,
@@ -34,12 +35,25 @@ PLEX_SYNC_PY = os.path.join(PLEX_SYNC_DIR, ".venv", "Scripts", "python.exe")
 PLEX_SYNC_MAIN = os.path.join(PLEX_SYNC_DIR, "main.py")
 TOOLS_HELP_FILE = os.path.join(os.path.dirname(__file__), "tools.txt")
 
-# Gmail broad-term filter for list searches
-_GENERIC_BROAD_TERMS = {"review", "feature", "contract"}
-
 from assistant_engine_tools import TOOLS, VALID_ACTIONS, _format_tools_for_prompt
-from assistant_engine_lighting import try_handle_lighting_action
-from auto_lighting_sync import start_auto_lighting_sync, stop_auto_lighting_sync
+from lighting.assistant_engine_lighting import (
+    get_last_nanoleaf_flow,
+    infer_flow_colors_hex,
+    infer_flow_speed,
+    persist_last_nanoleaf_flow,
+    try_handle_lighting_action,
+)
+from lighting.auto_lighting_sync import start_auto_lighting_sync, stop_auto_lighting_sync
+from music.play_resolver import (
+    format_play_resolution_reply,
+    looks_like_play_music_request,
+    resolve_play_to_video_id,
+)
+from music.spotify_resolver import (
+    format_spotify_resolution_reply,
+    looks_like_spotify_play_request,
+    resolve_spotify_play,
+)
 
 
 def _default_log(_msg: str) -> None:
@@ -59,6 +73,36 @@ class AssistantEngine:
         self.last_user_message: str | None = None
         self._profile_active: bool = False
         self._active_user_name: str = "Andrew"
+        self.last_timing_ms: dict[str, float] | None = None
+        self._router_llm_ms_sum: float = 0.0
+        self._reply_llm_ms_sum: float = 0.0
+
+    @contextmanager
+    def _timing_scope(self):
+        """Wall-clock and per-LLM-call timings for /chat profiling."""
+        wall_start = time.perf_counter()
+        self._router_llm_ms_sum = 0.0
+        self._reply_llm_ms_sum = 0.0
+        self.last_timing_ms = None
+        try:
+            yield
+        finally:
+            wall_ms = (time.perf_counter() - wall_start) * 1000
+            r = self._router_llm_ms_sum
+            p = self._reply_llm_ms_sum
+            self.last_timing_ms = {
+                "total_ms": round(wall_ms, 1),
+                "router_llm_ms": round(r, 1),
+                "reply_llm_ms": round(p, 1),
+                "other_ms": round(max(0.0, wall_ms - r - p), 1),
+            }
+
+    def _is_wake_sleep_phrase(self, text: str) -> bool:
+        """Match good morning/night variants like 'goodnight' and 'good-night'."""
+        t = (text or "").lower().strip()
+        if not t:
+            return False
+        return bool(re.search(r"\bgood[\s-]*morning\b", t) or re.search(r"\bgood[\s-]*night\b", t))
 
     def _is_lighting_related(self, text: str) -> bool:
         t = (text or "").lower()
@@ -78,6 +122,11 @@ class AssistantEngine:
                 "bright",
                 "cozy",
                 "warm",
+                # Phrases like "create an animation with rainbow colors" often omit "lights".
+                "animation",
+                "animate",
+                "pulse",
+                "rainbow",
             )
         )
 
@@ -158,6 +207,31 @@ class AssistantEngine:
         if any(x in t for x in lighting_terms):
             return False
 
+        # Explicit day references.
+        if any(k in t for k in ("tomorrow", "day after tomorrow", "today")):
+            return True
+        # Explicit calendar date like "March 30th".
+        if re.search(
+            r"\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|"
+            r"august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+"
+            r"\d{1,2}(?:st|nd|rd|th)?\b",
+            t,
+        ):
+            return True
+        if any(
+            re.search(rf"\b{rx}\b", t)
+            for rx in (
+                "monday|mon",
+                "tuesday|tue",
+                "wednesday|wed",
+                "thursday|thu",
+                "friday|fri",
+                "saturday|sat",
+                "sunday|sun",
+            )
+        ):
+            return True
+
         # Weather forecast signals.
         if any(k in t for k in ("forecast", "today", "for the day", "precipitation", "precip")):
             return True
@@ -167,6 +241,109 @@ class AssistantEngine:
         if re.search(r"\brain\b", t):
             return True
         return False
+
+    def _weather_forecast_day_offset(self, text: str) -> int:
+        """
+        Map user text to a day offset relative to "today" (0=today, 1=tomorrow, ...).
+
+        Examples handled:
+        - "tomorrow", "day after tomorrow"
+        - weekday names like "Wednesday" (next occurrence; can be today if asked on Wednesday)
+        - "next Wednesday" (forces a +7 jump when the weekday matches today)
+        """
+        t = (text or "").lower()
+
+        if "day after tomorrow" in t:
+            return 2
+        if "tomorrow" in t:
+            return 1
+        if "today" in t:
+            return 0
+
+        weekday_map = {
+            0: ("monday", "mon"),
+            1: ("tuesday", "tue"),
+            2: ("wednesday", "wed"),
+            3: ("thursday", "thu"),
+            4: ("friday", "fri"),
+            5: ("saturday", "sat"),
+            6: ("sunday", "sun"),
+        }
+        token = None
+        for offset, aliases in weekday_map.items():
+            for a in aliases:
+                if re.search(rf"\b{a}\b", t):
+                    token = offset
+                    break
+            if token is not None:
+                break
+
+        if token is None:
+            # Try parsing explicit calendar dates like "March 30th".
+            month_map = {
+                "january": 1,
+                "jan": 1,
+                "february": 2,
+                "feb": 2,
+                "march": 3,
+                "mar": 3,
+                "april": 4,
+                "apr": 4,
+                "may": 5,
+                "june": 6,
+                "jun": 6,
+                "july": 7,
+                "jul": 7,
+                "august": 8,
+                "aug": 8,
+                "september": 9,
+                "sep": 9,
+                "sept": 9,
+                "october": 10,
+                "oct": 10,
+                "november": 11,
+                "nov": 11,
+                "december": 12,
+                "dec": 12,
+            }
+
+            m = re.search(
+                r"\b(?P<month>january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|"
+                r"august|aug|september|sep|sept|october|oct|november|nov|december|dec)\s+"
+                r"(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(?P<year>\d{4}))?\b",
+                t,
+            )
+            if m:
+                month_s = (m.group("month") or "").lower()
+                day_s = m.group("day") or ""
+                year_s = m.group("year")
+                try:
+                    month = int(month_map.get(month_s) or 0)
+                    day = int(day_s)
+                    now_date = datetime.now().date()
+                    year = int(year_s) if year_s else now_date.year
+                    target = datetime(year, month, day).date()
+                    if not year_s and target < now_date:
+                        # If no year is specified and the date already passed this year,
+                        # assume the next occurrence.
+                        target = datetime(year + 1, month, day).date()
+                    offset = (target - now_date).days
+                    return max(0, int(offset))
+                except Exception:
+                    return 0
+
+            return 0
+
+        now = datetime.now()
+        today_wd = now.weekday()  # Monday=0
+        target_wd = token
+        delta = (target_wd - today_wd) % 7
+
+        if delta == 0 and "next" in t:
+            delta = 7
+
+        # Clamp to our forecast helper's supported range (weekday names only).
+        return max(0, min(7, int(delta)))
 
     def _is_brightness_status_query(self, text: str) -> bool:
         """
@@ -250,7 +427,7 @@ class AssistantEngine:
 
     def _should_skip_tool_router(self, text: str) -> bool:
         """
-        If the message is clearly just general chat (no lights/gmail/plex/memory actions),
+        If the message is clearly just general chat (no lights/plex/memory/weather actions),
         skip the router LLM call to reduce latency.
         """
         t = (text or "").lower()
@@ -271,9 +448,6 @@ class AssistantEngine:
             "animation",
             "flow",
             "create",
-            "email",
-            "gmail",
-            "inbox",
             "plex",
             "sync",
             "remember",
@@ -378,6 +552,7 @@ Hard rules:
 - If user mentions a color name, convert it to a reasonable hex (green=#00FF00, orange=#FFA500, purple=#800080, etc.).
 - If user mentions a percent, set brightness to that number. If user says dim/dimmer/dark -> 20-40. bright/brighter/max -> 80-100.
 - If brightness is not mentioned, brightness may be null.
+- For type \"animation\" you MUST set \"colors_hex\" to an array of at least 2 hex strings. Examples: rainbow -> 6+ distinct hues (#FF0000, #FF8800, #FFFF00, #00FF00, #0088FF, #8800FF); red and blue -> [\"#FF0000\", \"#0000FF\"]. Never leave colors_hex empty for animation.
 
 User: \"{user_text}\"
 
@@ -435,20 +610,30 @@ Reply with JSON only (no markdown)."""
                     out["brightness"] = None
             if atype == "animation":
                 cols = a.get("colors_hex")
+                if cols is None and isinstance(a.get("colors"), list):
+                    cols = a.get("colors")
                 if isinstance(cols, list):
                     out_cols = []
                     for c in cols:
                         s = str(c).strip()
                         if s.startswith("#") and len(s) == 7:
                             out_cols.append(s)
+                        elif len(s) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in s):
+                            out_cols.append("#" + s.upper())
                     out["colors_hex"] = out_cols[:6]
                 else:
                     out["colors_hex"] = []
+                if len(out["colors_hex"]) < 2:
+                    out["colors_hex"] = infer_flow_colors_hex(user_text)[:6]
                 sp = a.get("speed")
                 try:
-                    out["speed"] = max(0.5, min(5.0, float(sp))) if sp is not None else 1.0
+                    out["speed"] = (
+                        max(0.5, min(5.0, float(sp)))
+                        if sp is not None
+                        else infer_flow_speed(user_text)
+                    )
                 except Exception:
-                    out["speed"] = 1.0
+                    out["speed"] = infer_flow_speed(user_text)
             if atype == "scene":
                 name = a.get("scene_name")
                 if isinstance(name, str):
@@ -485,6 +670,9 @@ Reply with JSON only (no markdown)."""
     def _execute_lighting_plan(self, plan: dict) -> str:
         """Deterministically execute a validated lighting plan. Returns a short summary for system note."""
         actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
+        # Parsed lighting intent: always cancel Nanoleaf time-sync and Govee auto, even if validation
+        # dropped all actions (otherwise auto mode keeps winning over a custom scene).
+        stop_auto_lighting_sync(log_fn=self.log)
         notes: list[str] = []
         for a in actions:
             device = a.get("device")
@@ -558,11 +746,18 @@ Reply with JSON only (no markdown)."""
                     try:
                         if isinstance(cols, list) and len(cols) >= 2:
                             rgb = [(int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)) for c in cols]
-                            nanoleaf.create_flow_effect(rgb, float(speed))
-                            notes.append("Nanoleaf animation applied.")
+                            ok = nanoleaf.create_flow_effect(rgb, float(speed))
+                            if ok:
+                                notes.append("Nanoleaf flow animation applied.")
+                                persist_last_nanoleaf_flow(self._active_user_name, cols, float(speed))
+                            else:
+                                self.log("Nanoleaf create_flow_effect returned False.")
+                                notes.append("Nanoleaf flow animation failed (API rejected effect).")
+                        else:
+                            notes.append("Nanoleaf animation skipped (not enough colors after validation).")
                     except Exception as e:
                         self.log(f"Nanoleaf animation failed: {e}")
-                        notes.append("Nanoleaf update failed.")
+                        notes.append("Nanoleaf animation failed.")
                 elif atype == "scene":
                     name = a.get("scene_name")
                     try:
@@ -577,10 +772,26 @@ Reply with JSON only (no markdown)."""
         return " ".join(notes) if notes else "No lighting changes applied."
 
     def _route_speed_adjust(self, user_text: str) -> dict | None:
-        """If the user is asking to change animation speed and last action was nanoleaf.create_animation, return a route that re-applies the same animation with new speed. Otherwise return None."""
-        if self.last_route is None or self.last_route.get("action") != "nanoleaf.create_animation":
+        """
+        Re-apply the last custom flow with a new speed when the user asks faster/slower.
+        Uses last_route in-process or persisted state (each HTTP request uses a new engine).
+        Nanoleaf speed param: higher value = faster motion (see create_flow_effect).
+        """
+        prev_params: dict | None = None
+        if self.last_route and self.last_route.get("action") == "nanoleaf.create_animation":
+            pp = self.last_route.get("params") or {}
+            cols = pp.get("colors")
+            if isinstance(cols, list) and len(cols) >= 2:
+                prev_params = dict(pp)
+        if prev_params is None:
+            stored = get_last_nanoleaf_flow(getattr(self, "_active_user_name", None))
+            if stored and isinstance(stored.get("colors"), list) and len(stored["colors"]) >= 2:
+                prev_params = {
+                    "colors": list(stored["colors"]),
+                    "speed": float(stored.get("speed", 1.0)),
+                }
+        if not prev_params:
             return None
-        prev_params = self.last_route.get("params") or {}
         colors = prev_params.get("colors")
         if not isinstance(colors, list) or len(colors) < 2:
             return None
@@ -590,7 +801,6 @@ Reply with JSON only (no markdown)."""
         except (TypeError, ValueError):
             current = 1.0
         current = max(0.5, min(5.0, current))
-        # Faster: lower numeric speed = faster transition in our API
         if any(
             phrase in t
             for phrase in (
@@ -604,14 +814,19 @@ Reply with JSON only (no markdown)."""
                 "a little faster",
                 "make it faster",
                 "flow faster",
+                "pulse faster",
+                "animate faster",
+                "cycle faster",
+                "quicker",
+                "more quickly",
             )
         ):
-            if "super" in t or "really fast" in t or "max" in t:
-                new_speed = 0.5
+            if "super fast" in t or "really fast" in t or "maximum speed" in t or "max speed" in t:
+                new_speed = 5.0
             elif "a little" in t:
-                new_speed = max(0.5, round(current * 0.75, 1))
+                new_speed = min(5.0, round(current * 1.2, 1))
             else:
-                new_speed = max(0.5, round(current * 0.55, 1))
+                new_speed = min(5.0, round(current * 1.45, 1))
             return {
                 "action": "nanoleaf.create_animation",
                 "params": {
@@ -620,7 +835,6 @@ Reply with JSON only (no markdown)."""
                     "speed": new_speed,
                 },
             }
-        # Slower: higher numeric speed = slower transition
         if any(
             phrase in t
             for phrase in (
@@ -631,12 +845,13 @@ Reply with JSON only (no markdown)."""
                 "make it slower",
                 "more slowly",
                 "gentler",
+                "pulse slower",
             )
         ):
             if "a little" in t:
-                new_speed = min(5.0, round(current * 1.25, 1))
+                new_speed = max(0.5, round(current * 0.85, 1))
             else:
-                new_speed = min(5.0, round(current * 1.6, 1))
+                new_speed = max(0.5, round(current * 0.65, 1))
             return {
                 "action": "nanoleaf.create_animation",
                 "params": {
@@ -684,6 +899,31 @@ Reply with JSON only (no markdown)."""
             }
         return None
 
+    def _route_flow_animation(self, user_text: str) -> dict | None:
+        """
+        If the user clearly wants a new flowing/custom animation, return nanoleaf.create_animation
+        with colors from infer_flow_colors_hex — no lighting-plan LLM or tool router required.
+        """
+        if self._is_memory_request(user_text):
+            return None
+        t = (user_text or "").lower().strip()
+        if not (
+            ("animation" in t or "animate" in t)
+            and any(k in t for k in ("create", "custom", "make", "new", "build", "add"))
+        ) and not ("rainbow" in t and ("animation" in t or "animate" in t or "color" in t)):
+            return None
+        colors = infer_flow_colors_hex(user_text)
+        spd = infer_flow_speed(user_text)
+        self.log(f"Heuristic flow animation; colors={colors} speed={spd}")
+        return {
+            "action": "nanoleaf.create_animation",
+            "params": {
+                "animation_type": "flow",
+                "colors": colors,
+                "speed": spd,
+            },
+        }
+
     def route(self, user_text: str) -> dict:
         """Return {action, params} by asking the model to choose a tool from TOOLS based on the user's intent. No keyword routing."""
         prev_msg = self.last_user_message or ""
@@ -716,13 +956,12 @@ Interpret intent from the actual request. Examples:
 - "static purple" / "no animation, just blue" / "solid red" / "make them purple but not animated" → nanoleaf.custom (params.description = their full request). They want a single static color, no flowing animation.
 - "create a new animation" / "flowing red and blue" / "make them cycle through colors" / "new animation with yellow" → nanoleaf.create_animation with colors and optional speed. They want movement/animation.
 - "add a strong pulse" / "pulse" / "make up your own settings" → nanoleaf.custom.
-- "make it faster" / "speed it up" / "slower" (when previous action was nanoleaf.create_animation) → nanoleaf.create_animation again with same colors and new speed.
+- "make it faster" / "pulse faster" / "speed it up" / "slower" (after a custom Nanoleaf flow was applied) → nanoleaf.create_animation again with the same colors and new speed (the app may also handle this without you).
 - "turn the nanoleaf off" / "nanoleaf on" / "turn off the nanoleaf" → nanoleaf.set_state with state "off" or "on" (ONLY Nanoleaf; do NOT change Govee). Do NOT use nanoleaf.custom for this.
 - "make the nanoleaf lights dimmer" / "nanoleaf brighter" / "set nanoleaf to 50%" → nanoleaf.set_brightness (ONLY Nanoleaf brightness; do NOT change scene or Govee). Do NOT use lights.set_scene for this.
 - "turn lights on" / "lights off" (all lights) → lights.set_state with state "on" or "off"
 - "are the lights on?" → lights.get_state
 - "run Plex sync" → plex_sync.run
-- "check my email for X" → gmail.search with query/scope/result_type
 - "remember that writing mode means dim orange lights" → memory.remember (key: "writing mode", value: "dim orange lights")
 
 If the user said "again" or "same thing", repeat the previous action. Do not choose "none" when the user is asking you to change the lights or set a mood—use lights.set_scene or nanoleaf.set_scene as appropriate. If they ask to "create a new animation" or "create an animation for the lights", always use nanoleaf.create_animation with colors (and optional speed)—never respond with a list of settings for them to enter in an app.
@@ -736,9 +975,10 @@ Respond with JSON only:
 {{"action": "<tool name from the list above>", "params": {{...}}}}
 """
         try:
-            t0 = time.perf_counter() if self._profile_active else None
+            t0 = time.perf_counter()
             response = ask_lmstudio(tool_choice_prompt)
-            if self._profile_active and t0 is not None:
+            self._router_llm_ms_sum += (time.perf_counter() - t0) * 1000
+            if self._profile_active:
                 self.log(f"PROFILE: router_model_call={time.perf_counter() - t0:.2f}s")
             raw = response["output"][0]["content"].strip()
             if raw.startswith("```"):
@@ -803,14 +1043,14 @@ Respond with JSON only:
                 " you that the lights were set to a state, you may speak as if that action has already"
                 " been performed.\n"
                 "- The app may also display separate System messages with the results of tools"
-                " (for example, Gmail searches, Plex sync, weather). Those System messages are the"
+                " (for example, Plex sync, weather). Those System messages are the"
                 " source of truth about my real data.\n"
                 "- VERY IMPORTANT: Do NOT repeat System notes verbatim or list them like logs"
                 " (e.g. 'Lights set:', 'Weather:', 'Quick news summary:'). Instead"
                 " briefly and naturally incorporate only the important parts"
                 " into your reply, or skip details I didn't explicitly ask for.\n\n"
                 "CRITICAL SAFETY RULES:\n"
-                "- Do NOT invent or guess specific facts about my personal data or file contents.\n"
+                "- Do NOT invent or guess specific facts.\n"
                 "- If you are not given an explicit System note or tool result that contains those"
                 " facts, you must say that you don't know instead of making something up.\n"
                 "- You may still answer general questions with your own knowledge, but never fabricate"
@@ -818,11 +1058,6 @@ Respond with JSON only:
             "- Weather safety: If the user asks about weather (current or forecast), you may only state"
             " it when you were given a System note or tool result that contains the weather."
             " Otherwise, say you don't know.\n\n"
-                "- The user has a D&D campaign folder (notes and maps). You do not have access to it"
-                " from this chat. If they ask, say that the D&D improv feature does: when they open"
-                " http://localhost:8000/dnd in a browser (with the API server running), they can"
-                " record or paste conversation and click Get suggestion to get dialogue that uses"
-                " that folder.\n\n"
             )
         action_note = ""
         if light_action in ("on", "off", "auto"):
@@ -831,148 +1066,15 @@ Respond with JSON only:
             action_note = action_note + extra_note
         full_prompt = f"{system_preamble}{action_note}User: {prompt}"
         try:
-            t0 = time.perf_counter() if self._profile_active else None
+            t0 = time.perf_counter()
             response = ask_lmstudio(full_prompt)
-            if self._profile_active and t0 is not None:
+            self._reply_llm_ms_sum += (time.perf_counter() - t0) * 1000
+            if self._profile_active:
                 self.log(f"PROFILE: assistant_model_call={time.perf_counter() - t0:.2f}s")
             return (response.get("output") or [{}])[0].get("content", "").strip() or "No response."
         except Exception as e:
             self.log(f"Model error: {e}")
             return f"Error calling model: {e}"
-
-    def _interpret_email_list(self, user_question: str, messages: list[dict]) -> str | None:
-        """Ask the model which emails match; return reply or None."""
-        max_for_interpretation = 45
-        if len(messages) > max_for_interpretation:
-            messages = messages[:max_for_interpretation]
-        if not messages:
-            try:
-                response = ask_lmstudio(
-                    "The user asked about their email:\n\n"
-                    f'"{user_question}"\n\n'
-                    "We searched their Gmail and found no messages matching the search. "
-                    "Reply in one short sentence that no matching emails were found."
-                )
-                return (response.get("output") or [{}])[0].get("content", "").strip() or None
-            except Exception as e:
-                self.log(f"Email interpretation (no results) failed: {e}")
-                return None
-        lines = []
-        for i, m in enumerate(messages, 1):
-            from_ = m.get("from", "")
-            subj = m.get("subject", "")
-            date = m.get("date", "")
-            snippet = m.get("snippet", "")
-            parts = [f"{i}. From: {from_}", f"Subject: {subj}"]
-            if date:
-                parts.append(f"Date: {date}")
-            line = " | ".join(parts)
-            if snippet:
-                line += "\n   Snippet: " + snippet
-            lines.append(line)
-        email_list_text = "\n".join(lines)
-        prompt = (
-            "The user asked about their email:\n\n"
-            f'"{user_question}"\n\n'
-            "Here are emails from their inbox (newest first), with a short body snippet for each:\n\n"
-            f"{email_list_text}\n\n"
-            "Which of these emails match what they're looking for? Use the snippet to recognize "
-            "acceptances: e.g. 'would love to feature', 'we'd like to publish', 'accept your story', "
-            "'contract', 'feature it', 'work with me on edits', 'I can publish it', 'publish it in the [issue]', "
-            "'earliest available opening', 'would you be willing to work with me'—even if the subject doesn't say 'accepted'. "
-            "If one or more match, say which one(s) and give the most relevant detail. "
-            "If none match, say so briefly. Reply in 1–4 concise sentences; do not invent any emails not in the list."
-        )
-        try:
-            response = ask_lmstudio(prompt)
-            text = (response.get("output") or [{}])[0].get("content", "").strip()
-            return text or None
-        except Exception as e:
-            self.log(f"Email interpretation failed: {e}")
-            return None
-
-    def _search_gmail_sync(
-        self,
-        user_question: str,
-        query: str,
-        scope: str,
-        result_type: str,
-        category: str | None,
-        broad_search_terms: list[str] | None,
-    ) -> str:
-        """Run Gmail search + optional interpretation; return summary string. Then caller uses it for _call_model."""
-        search_query = query
-        max_results = 20
-        if result_type == "list" and broad_search_terms:
-            narrow_terms = [t for t in broad_search_terms if t.lower() not in _GENERIC_BROAD_TERMS]
-            if not narrow_terms:
-                narrow_terms = list(broad_search_terms)
-            search_query = " OR ".join(narrow_terms)
-            max_results = 80
-        self.log(f"Gmail search started (scope={scope}, result={result_type}).")
-        count_only = result_type == "count"
-        try:
-            messages = search_gmail(
-                query=search_query,
-                scope=scope,
-                max_results=max_results,
-                category=category,
-                count_only=count_only,
-            )
-        except GmailClientError as e:
-            self.log(f"Gmail error: {e}")
-            return self._call_model(
-                user_question,
-                None,
-                extra_note="System note: The app tried to search Gmail but failed. Tell the user briefly that the search failed and they can try again.\n\n",
-            )
-        total = len(messages)
-        thread_count = None
-        if count_only and messages and isinstance(messages[0], dict):
-            m0 = messages[0]
-            if "_count" in m0:
-                total = int(m0["_count"])
-            if "_thread_count" in m0:
-                thread_count = int(m0["_thread_count"])
-        if total == 0 and (thread_count is None or thread_count == 0):
-            if result_type == "count" and scope == "unread":
-                summary = "You have 0 unread Gmail messages."
-            elif result_type == "count":
-                summary = "You have 0 Gmail messages matching that query."
-            else:
-                summary = (
-                    self._interpret_email_list(user_question.strip(), [])
-                    if user_question.strip()
-                    else "No matching Gmail messages found."
-                )
-                summary = summary or "No matching Gmail messages found."
-        else:
-            if result_type == "count":
-                if thread_count is not None and category:
-                    summary = f"You have {thread_count} unread conversation(s) in {category} ({total:,} message(s))."
-                elif scope == "unread":
-                    summary = f"You have {total:,} unread Gmail message(s)."
-                else:
-                    summary = f"You have {total:,} Gmail message(s) matching that query."
-            else:
-                if user_question.strip():
-                    interpretation = self._interpret_email_list(user_question.strip(), messages)
-                    if interpretation:
-                        summary = interpretation
-                    else:
-                        summary = (
-                            f"I found {total} email(s) matching your search but couldn't "
-                            "interpret which one answers your question. Try asking again."
-                        )
-                else:
-                    lines = [f"- {m.get('from', '')} — {m.get('subject', '')}" for m in messages]
-                    summary = f"Found {total} matching Gmail message(s):\n" + "\n".join(lines)
-        self.log(summary)
-        return self._call_model(
-            user_question,
-            None,
-            extra_note="The app ran a Gmail search. Use this result to answer the user in one concise message. Do not repeat the raw list; summarize or answer their question.\n\nResult:\n" + summary + "\n\n",
-        )
 
     def _run_plex_sync_background(self) -> None:
         try:
@@ -1052,6 +1154,10 @@ Respond with JSON only:
         """
         Route the message, run any tool, then call the model once. Return the assistant reply.
         """
+        with self._timing_scope():
+            return self._handle_message_impl(user_text, user_name)
+
+    def _handle_message_impl(self, user_text: str, user_name: str | None = None) -> str:
         # Hard-wired routines for wake/sleep phrases so they are stable and fast.
         t_raw = (user_text or "").lower()
         normalized_name = (user_name or "").strip()
@@ -1073,10 +1179,19 @@ Respond with JSON only:
 
         total_t0 = time.perf_counter() if self._profile_active else None
 
-        if "good morning" in t_raw:
+        if self._is_wake_sleep_phrase(t_raw) and re.search(r"\bgood[\s-]*morning\b", t_raw):
             return self._run_morning_routine(user_text)
-        if "good night" in t_raw:
+        if self._is_wake_sleep_phrase(t_raw) and re.search(r"\bgood[\s-]*night\b", t_raw):
             return self._run_night_routine(user_text)
+
+        # Spotify (explicit phrasing) before generic "Play …" (YouTube).
+        if looks_like_spotify_play_request(user_text):
+            res = resolve_spotify_play(user_text)
+            return format_spotify_resolution_reply(res)
+        # YouTube "Play …" → search → video_id (pass to Pi / player separately).
+        if looks_like_play_music_request(user_text):
+            res = resolve_play_to_video_id(user_text)
+            return format_play_resolution_reply(res)
 
         if self._is_help_request(user_text):
             tool_lines = self._load_help_tools()
@@ -1105,8 +1220,14 @@ Respond with JSON only:
         # Deterministic weather handling: never guess if the API fails.
         if self._is_weather_forecast_query(user_text):
             try:
-                return get_day_weather_forecast_summary()
-            except WeatherClientError:
+                day_offset = self._weather_forecast_day_offset(user_text)
+                return get_day_weather_forecast_summary(day_offset=day_offset)
+            except WeatherClientError as e:
+                emsg = (str(e) or "").strip()
+                if emsg:
+                    # For range errors, we want the user-facing message.
+                    if "forecast up to" in emsg or "days away" in emsg:
+                        return emsg
                 return "I can't fetch the daily weather forecast right now. Please try again shortly."
 
         if self._is_weather_query(user_text):
@@ -1241,8 +1362,23 @@ Respond with JSON only:
                 compact_system=True,
             )
 
+        # Deterministic flow animations: skip lighting-plan + router LLM when intent is unambiguous.
+        flow_route = self._route_flow_animation(effective_text)
+        if flow_route is not None:
+            self.last_route = flow_route
+            self.last_user_message = effective_text
+            lighting_reply = try_handle_lighting_action(
+                self,
+                flow_route["action"],
+                flow_route["params"],
+                user_text,
+                effective_text,
+            )
+            if lighting_reply is not None:
+                return lighting_reply
+
         # New structured-plan pipeline for lighting requests (semantic parse -> deterministic executor).
-        # Keep the old tool-choice router for non-lighting (gmail/plex/etc.) and for memory.remember.
+        # Keep the old tool-choice router for non-lighting (plex/memory/etc.).
         if self._is_lighting_related(effective_text) and not self._is_memory_request(effective_text):
             scenes = nanoleaf.get_scene_list()
             plan = self._parse_lighting_plan(effective_text, scenes)
@@ -1251,30 +1387,41 @@ Respond with JSON only:
                 note = self._execute_lighting_plan(cleaned)
                 self.log("Lighting plan executed.")
 
-                # For lighting, we do NOT want the model to narrate logs like "Lights set: ...".
-                # We rely on side effects only, and optionally give it weather for "good morning".
+                # Tell the model what actually happened (prevents empty affirmations when hardware did nothing).
                 extra = ""
+                if note and note.strip():
+                    if note.strip() == "No lighting changes applied.":
+                        extra = (
+                            "System note: No lighting actions were applied (plan had no executable steps). "
+                            "Do NOT claim you changed the lights; briefly say it did not work or ask what look they want.\n\n"
+                        )
+                    else:
+                        extra = f"System note: Lighting result: {note}\n\n"
+
+                # Optionally add weather for "good morning" on top of the lighting note.
                 if "good morning" in (user_text or "").lower():
                     try:
                         weather = get_current_weather_summary()
-                        extra = (
-                            "System note: The app has already set a warm morning lighting scene."
+                        gm = (
+                            "The app has already set a warm morning lighting scene."
                             f" Briefly greet Andrew with 'Good morning, Andrew.' and naturally mention"
                             f" the current weather: {weather}. Do NOT list internal details like"
                             " 'Lights set:' or repeat this note verbatim.\n\n"
                         )
+                        extra = (extra or "") + "System note: " + gm
                     except WeatherClientError as e:
                         self.log(f"Weather fetch failed: {e}")
-                        extra = (
-                            "System note: The app has already set a warm morning lighting scene."
+                        gm = (
+                            "The app has already set a warm morning lighting scene."
                             " Briefly greet Andrew with 'Good morning, Andrew.' You do not know"
                             " the current weather.\n\n"
                         )
+                        extra = (extra or "") + "System note: " + gm
 
                 return self._call_model(
                     effective_text,
                     None,
-                    extra_note=extra,
+                    extra_note=extra or None,
                 )
 
         # For non-lighting, non-weather, non-memory requests that are clearly just chat,
@@ -1317,34 +1464,6 @@ Respond with JSON only:
         if lighting_reply is not None:
             return lighting_reply
 
-        if action == "gmail.search":
-            raw_query = str(params.get("query") or user_text).strip()
-            query = " ".join(w for w in raw_query.split() if ":" not in w) or raw_query
-            scope = str(params.get("scope") or "unread").lower()
-            text_lower = user_text.lower()
-            if "unread" in text_lower:
-                scope = "unread"
-            elif any(w in text_lower for w in (" last ", " latest", "most recent")):
-                scope = "all"
-            if scope not in ("unread", "all"):
-                scope = "unread"
-            result_type = str(params.get("result_type") or "list").lower()
-            if result_type not in ("count", "list"):
-                result_type = "list"
-            category = params.get("category")
-            if isinstance(category, str):
-                category = category.lower()
-                if category not in ("updates", "primary", "promotions", "social", "forums"):
-                    category = None
-            else:
-                category = None
-            broad_terms = params.get("broad_search_terms")
-            if isinstance(broad_terms, list) and result_type == "list":
-                broad_terms = [str(t).strip() for t in broad_terms if t and ":" not in str(t)][:8]
-            else:
-                broad_terms = None
-            return self._search_gmail_sync(user_text, query, scope, result_type, category, broad_terms)
-
         if action == "plex_sync.run":
             self.log("Plex sync started in the background.")
             threading.Thread(target=self._run_plex_sync_background, daemon=True).start()
@@ -1364,13 +1483,20 @@ def handle_message(
     user_text: str,
     log_fn: Optional[Callable[[str], None]] = None,
     user_name: str | None = None,
+    timing_out: dict | None = None,
 ) -> str:
     """
     One-shot: create engine, handle message, return reply.
     Use this from FastAPI or scripts. For multi-turn with follow-ups, use AssistantEngine() and call handle_message on it.
+    If ``timing_out`` is a dict, it is filled with ``last_timing_ms`` keys (total_ms, router_llm_ms, …).
     """
     engine = AssistantEngine(log_fn=log_fn)
-    return engine.handle_message(user_text, user_name=user_name)
+    reply = engine.handle_message(user_text, user_name=user_name)
+    if timing_out is not None:
+        timing_out.clear()
+        if engine.last_timing_ms:
+            timing_out.update(engine.last_timing_ms)
+    return reply
 
 
 if __name__ == "__main__":

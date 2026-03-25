@@ -17,4 +17,7 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
-nanoleaf/token.txt
+lighting/nanoleaf/token.txt
+
+# Spotify OAuth token cache (spotipy)
+.cache-spotify

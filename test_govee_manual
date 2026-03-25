@@ -1,5 +1,5 @@
 # H:\Coding\AI_assistant\test_govee_manual.py
-from lights_client import set_lights_style
+from lighting.lights_client import set_lights_style
 
 # 1) Simple on only
 set_lights_style(state="on")

@@ -37,16 +37,16 @@ TOOLS = [
     {
         "name": "nanoleaf.set_scene",
         "description": "Set ONLY the Nanoleaf panels to a predefined SCENE from the list (e.g. Romantic, Northern Lights, Inner Peace). Use when the user asks for a mood that fits a scene name. Do NOT use for: pulse, 'add a pulse', breathing, 'custom', 'without using scenes', 'make up your own'—use nanoleaf.custom for those.",
-        "params": [{"name": "description", "type": "string", "description": "The mood that should match a scene na   (e.g. romantic, peaceful)"}],
+        "params": [{"name": "description", "type": "string", "description": "The mood that should match a scene name (e.g. romantic, peaceful)"}],
     },
     {
         "name": "nanoleaf.custom",
-        "description": "Set BOTH Govee and Nanoleaf to a static color and brightness, or a pulse/custom mood. Use when the user wants a STATIC or SOLID color with NO animation (e.g. 'static purple', 'no animation just blue', 'solid red', 'make them purple but not animated'). Also use for pulse, 'add a pulse', rhythm, or 'make up your own settings'. Interpret their words: if they say static, no animation, solid, or don't want movement → this tool sets a single static color; if they want a flowing/animated effect → use nanoleaf.create_animation instead. Do NOT use for a mood that matches a scene name—use nanoleaf.set_scene instead.",
+        "description": "Set BOTH Govee and Nanoleaf to a static color and brightness, or pick a built-in Nanoleaf scene for pulse-like looks. Use for STATIC or SOLID color (e.g. 'static purple', 'solid red', 'no animation'). Do NOT use for 'create animation', 'custom animation', 'flowing', 'rainbow cycle', or colors moving across panels—those require nanoleaf.create_animation. Do NOT use for a mood that matches a predefined scene name—use nanoleaf.set_scene instead.",
         "params": [{"name": "description", "type": "string", "description": "The full request (e.g. static purple, no animation blue, strong pulse, custom somber)"}],
     },
     {
         "name": "nanoleaf.create_animation",
-        "description": "CREATE a flowing/animated color effect on the Nanoleaf panels (colors cycle or flow). Use ONLY when the user clearly wants movement/animation: e.g. 'create an animation', 'flowing colors', 'make them cycle through red and blue', 'new animation'. Do NOT use when they want a static, solid, or non-animated color—use nanoleaf.custom for that. Pick 2–6 colors and optional speed.",
+        "description": "CREATE a flowing/animated color effect on Nanoleaf (colors cycle across panels). Use for 'create animation', 'custom animation', 'new animation', 'rainbow', 'flow', 'cycle colors', 'red and blue alternating', any request for moving/changing colors over time. Pick 2–6 hex colors in params.colors (e.g. #FF0000, #0000FF); if unsure, use red+blue or a rainbow set. Do NOT use for solid/static single color—use nanoleaf.custom.",
         "params": [
             {"name": "animation_type", "type": "string", "description": "One of: flow"},
             {"name": "colors", "type": "array", "description": 'List of hex color strings, e.g. ["#FF0000", "#00FF00", "#0000FF"]. Need at least 2 for flow.'},

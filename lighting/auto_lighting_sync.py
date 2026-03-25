@@ -12,9 +12,9 @@ from typing import Callable
 
 import requests
 
-from lights_client import set_lights_auto, LightsClientError
-from nanoleaf import nanoleaf
-from weather_client import _get_coords
+from .lights_client import exit_lights_auto_mode, set_lights_auto, LightsClientError
+from .nanoleaf import nanoleaf
+from misc_tools.weather_client import _get_coords
 
 _lock = threading.Lock()
 _thread: threading.Thread | None = None
@@ -169,6 +169,10 @@ def stop_auto_lighting_sync(log_fn: Callable[[str], None] | None = None) -> None
         _stop_event.set()
     if log_fn:
         log_fn("Requested stop for Nanoleaf auto sync.")
+    # Govee may still be in /auto until we POST /manual/; Nanoleaf-only scenes never hit set_color/toggle.
+    if exit_lights_auto_mode():
+        if log_fn:
+            log_fn("Govee left automatic mode (manual scene / override).")
 
 
 def is_auto_lighting_sync_live() -> bool:

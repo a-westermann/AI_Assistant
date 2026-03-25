@@ -12,6 +12,8 @@ BASE_URL = os.getenv("GOVEE_LIGHTS_BASE_URL", "").rstrip("/")
 AUTH_TOKEN = os.getenv("GOVEE_LIGHTS_TOKEN", "")
 # Optional: override status path if your server uses something other than "status" (e.g. "state")
 STATUS_PATH = (os.getenv("GOVEE_LIGHTS_STATUS_PATH") or "status").strip("/") or "status"
+# Optional: POST path to leave automatic mode when user applies a manual scene (default "manual")
+MANUAL_PATH = (os.getenv("GOVEE_LIGHTS_MANUAL_PATH") or "manual").strip("/") or "manual"
 
 
 class LightsClientError(Exception):
@@ -240,6 +242,32 @@ def set_lights_auto() -> dict[str, Any]:
     return data
 
 
+def exit_lights_auto_mode() -> bool:
+    """
+    Best-effort: leave Govee automatic/daylight mode when the user applies a manual scene.
+
+    POST {BASE_URL}/{MANUAL_PATH}/ with the same auth as /auto. If the endpoint is missing
+    (404) or the client is unconfigured, returns False and does not raise.
+    """
+    if not BASE_URL or not AUTH_TOKEN:
+        return False
+    base = BASE_URL.rstrip("/")
+    path = MANUAL_PATH.strip("/")
+    url = f"{base}/{path}/"
+    headers = _auth_headers()
+    try:
+        response = requests.post(url, headers=headers, timeout=15)
+    except Exception:
+        return False
+    if response.status_code == 404:
+        return False
+    try:
+        data = response.json()
+    except Exception:
+        return False
+    return bool(response.ok and data.get("success", False))
+
+
 def set_lights_style(
     *,
     state: State = "on",
@@ -323,7 +351,7 @@ def set_lights_style(
 
 
 if __name__ == "__main__":
-    # Run: python lights_client.py   (with env vars set) to see the status URL and test it
+    # Run from repo root: python -m lighting.lights_client  (with env vars set)
     print("BASE_URL:", BASE_URL or "(not set)")
     print("Status URL:", f"{BASE_URL}/{STATUS_PATH}/" if BASE_URL else "N/A")
     if not BASE_URL or not AUTH_TOKEN:

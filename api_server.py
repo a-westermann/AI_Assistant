@@ -10,7 +10,9 @@ import asyncio
 import os
 import tempfile
 import threading
+import time
 import random
+import re
 import requests
 from collections import deque
 from pathlib import Path
@@ -22,37 +24,63 @@ from pydantic import BaseModel
 
 from assistant_engine import handle_message
 from faster_whisper import WhisperModel
-from dnd_loader import (
+from dnd.dnd_loader import (
     build_context_from_llm_selection,
     get_selection_catalog,
+    get_rag_context,
     load_images_as_data_urls,
     _parse_llm_selection_response,
 )
 from llm import ask_lmstudio, ask_lmstudio_with_images
-from lights_client import (
+from lighting.lights_client import (
+    get_lights_state,
     toggle_all_lights,
     set_lights_auto,
     set_lights_style,
     LightsClientError,
 )
-from nanoleaf.nanoleaf import (
+from lighting.nanoleaf.nanoleaf import (
     turn_on,
     turn_off,
     set_effect,
     set_brightness as set_nanoleaf_brightness,
     get_scene_list,
     get_token as get_nanoleaf_token,
+    get_last_flow_attempt,
     NANOLEAF_IP,
 )
-from user_memory import resolve_alias, resolve_alias_match
-from weather_client import (
+from misc_tools.user_memory import resolve_alias, resolve_alias_match
+from misc_tools.weather_client import (
     get_current_weather_summary,
     get_day_weather_forecast_summary,
     get_weather_ui_payload,
     WeatherClientError,
 )
-from auto_lighting_sync import start_auto_lighting_sync, stop_auto_lighting_sync, is_auto_lighting_sync_live
-from shopping_list_store import (
+from lighting.auto_lighting_sync import (
+    start_auto_lighting_sync,
+    stop_auto_lighting_sync,
+    is_auto_lighting_sync_live,
+)
+from music.play_resolver import (
+    PlayResolution,
+    format_play_resolution_reply,
+    looks_like_play_music_request,
+    resolve_play_to_video_id,
+)
+from music.spotify_client import (
+    SpotifyAuthRequiredError,
+    SpotifyNotConfiguredError,
+    list_connect_devices,
+    spotify_credentials_configured,
+    spotify_has_cached_token,
+)
+from music.spotify_resolver import (
+    SpotifyResolution,
+    format_spotify_resolution_reply,
+    looks_like_spotify_play_request,
+    resolve_spotify_play,
+)
+from misc_tools.shopping_list_store import (
     add_item as shopping_add_item,
     update_item as shopping_update_item,
     delete_item as shopping_delete_item,
@@ -65,6 +93,7 @@ from shopping_list_store import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 stt_model: WhisperModel | None = None
 stt_lock = asyncio.Lock()
 _async_failures: deque[str] = deque(maxlen=20)
@@ -75,31 +104,121 @@ def _log_event(msg: str) -> None:
     logger.info(msg)
 
 
+def _is_wake_sleep_phrase(text: str) -> bool:
+    """Match good morning/night variants like 'goodnight' and 'good-night'."""
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+    return bool(re.search(r"\bgood[\s-]*morning\b", t) or re.search(r"\bgood[\s-]*night\b", t))
+
+
+def _needs_full_lighting_chat_sync(text: str) -> bool:
+    """
+    True for Nanoleaf custom / flow animations: full /chat pipeline + real reply + nanoleaf_flow.
+    Must be broad: speech and typos often omit words like 'colors' that the old lighting detector needed.
+    """
+    if not (text or "").strip():
+        return False
+    t = (text or "").lower()
+    if re.search(r"\banimation|animating|animated\b|\banimate\b", t):
+        return True
+    if "rainbow" in t or "pride" in t:
+        return True
+    if "multicolor" in t or "multi-color" in t or "multi color" in t:
+        return True
+    if "custom" in t and re.search(r"\banimation|animating|animate|effect|flow\b", t):
+        return True
+    if any(k in t for k in ("create", "make", "new", "build", "add")) and re.search(
+        r"\banimation|animate|rainbow|flowing|multicolor|cycle\b", t
+    ):
+        return True
+    if "flow" in t and any(
+        w in t for w in ("color", "colors", "colour", "light", "lights", "nanoleaf", "panel", "cycle")
+    ):
+        return True
+    return False
+
+
+def _nanoleaf_flow_fresh_since(start_time: float) -> dict | None:
+    """Return last flow attempt if it occurred during this /chat request (approx)."""
+    nf = get_last_flow_attempt()
+    if not nf:
+        return None
+    if float(nf.get("time_unix") or 0) >= start_time - 0.25:
+        return dict(nf)
+    return None
+
+
+def _lighting_alias_expansion(message: str) -> str | None:
+    raw = (message or "").strip()
+    if not raw:
+        return None
+    match = resolve_alias_match(raw)
+    expanded = match[1] if match else resolve_alias(raw)
+    if expanded and expanded.strip() and expanded.strip() != raw:
+        return expanded.strip()
+    return None
+
+
+def _use_background_lighting_ack(message: str) -> bool:
+    """Instant canned reply + background handle_message for simple lighting only."""
+    if _needs_full_lighting_chat_sync(message):
+        return False
+    exp = _lighting_alias_expansion(message)
+    if exp and _needs_full_lighting_chat_sync(exp):
+        return False
+    return True
+
+
 def _looks_like_lighting_action_text(text: str) -> bool:
     t = (text or "").lower().strip()
     if not t:
         return False
-    # Let full wake/sleep routines run normally (they include greeting/weather behavior).
-    if "good morning" in t or "good night" in t:
+    if _is_wake_sleep_phrase(t):
         return False
     if "remember " in t and ("means" in t or "i mean" in t or "when i say" in t):
-        # Explicit memory-writing commands should not become background light actions.
         return False
-    device_words = ("light", "lights", "govee", "nanoleaf", "scene", "brightness", "color")
-    command_words = ("turn", "set", "make", "dim", "bright", "scene", "auto", "off", "on", "pulse", "animation")
+    device_words = (
+        "light",
+        "lights",
+        "govee",
+        "nanoleaf",
+        "scene",
+        "brightness",
+        "color",
+        "colour",
+        "rainbow",
+    )
+    command_words = (
+        "turn",
+        "set",
+        "make",
+        "dim",
+        "bright",
+        "scene",
+        "auto",
+        "off",
+        "on",
+        "pulse",
+        "animation",
+        "create",
+        "custom",
+    )
     return any(w in t for w in device_words) and any(w in t for w in command_words)
 
 
 def _looks_like_background_lighting_action(message: str) -> tuple[bool, str | None]:
-    """Detect direct light commands OR alias phrases that expand to light commands."""
+    """Direct light commands or aliases that expand to light commands."""
     raw = (message or "").strip()
     if not raw:
+        return False, None
+    if _is_wake_sleep_phrase(raw):
         return False, None
     if _looks_like_lighting_action_text(raw):
         return True, None
     match = resolve_alias_match(raw)
     expanded = match[1] if match else resolve_alias(raw)
-    if expanded and ("good morning" in expanded.lower() or "good night" in expanded.lower()):
+    if expanded and _is_wake_sleep_phrase(expanded):
         return False, None
     if expanded and expanded != raw and _looks_like_lighting_action_text(expanded):
         matched_key = match[0] if match else None
@@ -142,11 +261,9 @@ def _pop_async_failure() -> str | None:
 
 
 def _run_background_action(message: str) -> None:
-    """Run a command in background; record only failures."""
     try:
         reply = handle_message(message, log_fn=_log_event) or ""
         low = reply.lower()
-        # Keep this conservative: only queue obvious failure responses.
         if any(x in low for x in ("failed", "error", "sorry")):
             _record_async_failure(reply)
     except Exception as e:
@@ -192,8 +309,11 @@ async def lifespan(app: FastAPI):
     # Whisper STT is loaded lazily on the first /stt request so server startup
     # doesn't block on downloading the model.
     logger.info("Whisper STT will load on first /stt request.")
-    yield
-    logger.info("Shutting down.")
+
+    try:
+        yield
+    finally:
+        logger.info("Shutting down.")
 
 
 app = FastAPI(title="Galadrial API", lifespan=lifespan)
@@ -204,16 +324,64 @@ class ChatRequest(BaseModel):
     user_name: str | None = None
 
 
+class MusicSearchPayload(BaseModel):
+    """YouTube search result for a \"Play …\" message (video id for a downstream player)."""
+
+    ok: bool
+    video_id: str | None = None
+    title: str | None = None
+    search_query: str | None = None
+    raw_intent: str | None = None
+    error: str | None = None
+
+
+class SpotifyPlayPayload(BaseModel):
+    """Spotify URI + optional Connect playback result (librespot / Pi as a Connect device)."""
+
+    ok: bool
+    uri: str | None = None
+    kind: str = "track"
+    name: str | None = None
+    artists: str | None = None
+    search_query: str | None = None
+    raw_intent: str | None = None
+    playback_started: bool = False
+    device_id: str | None = None
+    error: str | None = None
+    playback_error: str | None = None
+
+
 class ChatResponse(BaseModel):
     reply: str
+    music: MusicSearchPayload | None = None
+    spotify: SpotifyPlayPayload | None = None
+    # Set on synchronous /chat when create_flow_effect ran this request (check ok / detail without seeing panels).
+    nanoleaf_flow: dict | None = None
+    # Server + optional client timings for profiling (see web UI RESPONSE PROFILE).
+    timing: dict | None = None
 
 
 class DndImprovRequest(BaseModel):
     transcript: str
 
 
+class DndAskRequest(BaseModel):
+    """
+    D&D Q&A: ask questions on the fly during a session.
+
+    `transcript` is optional; providing it improves retrieval relevance.
+    """
+
+    question: str
+    transcript: str | None = None
+    # Maps can cause very large prompts (base64 data urls). For on-the-fly Q&A,
+    # we default to notes-only and let you enable maps explicitly later.
+    use_maps: bool = False
+
+
 class SttResponse(BaseModel):
     transcript: str
+    transcribe_server_ms: float | None = None
 
 
 class GoveeStateRequest(BaseModel):
@@ -249,7 +417,19 @@ class WeatherUiResponse(BaseModel):
     current_temp_f: int | None
     current_desc: str
     current_icon: str
+    day_summary: str | None = None
     hourly: list[dict]
+
+
+class BenchmarkResponse(BaseModel):
+    """
+    Fixed prompt benchmark response for measuring assistant timing.
+    Useful for quick "hit endpoint in browser" speed checks.
+    """
+
+    prompt: str
+    reply: str
+    timing: dict | None = None
 
 
 class ShoppingItemCreateRequest(BaseModel):
@@ -268,6 +448,58 @@ class ShoppingSortOrderRequest(BaseModel):
 
 class ShoppingReplaceAllRequest(BaseModel):
     items: list[dict]
+
+
+class MusicPrepareRequest(BaseModel):
+    """Phrase like \"Play Polica\" (must match play intent — leading Play …)."""
+
+    phrase: str
+
+
+class MusicPrepareResponse(BaseModel):
+    reply: str
+    music: MusicSearchPayload
+
+
+class SpotifyPrepareRequest(BaseModel):
+    """Phrase like \"Play lo-fi on Spotify\" or \"Spotify play Metallica\" (see spotify_resolver patterns)."""
+
+    phrase: str
+    device_id: str | None = None
+    attempt_playback: bool = True
+    skip_llm_refinement: bool = False
+
+
+class SpotifyPrepareResponse(BaseModel):
+    reply: str
+    spotify: SpotifyPlayPayload
+
+
+def _music_search_payload(res: PlayResolution) -> MusicSearchPayload:
+    return MusicSearchPayload(
+        ok=res.ok,
+        video_id=res.video_id,
+        title=res.title,
+        search_query=res.search_query,
+        raw_intent=res.raw_intent,
+        error=res.error if not res.ok else None,
+    )
+
+
+def _spotify_play_payload(res: SpotifyResolution) -> SpotifyPlayPayload:
+    return SpotifyPlayPayload(
+        ok=res.ok,
+        uri=res.uri,
+        kind=res.kind,
+        name=res.name,
+        artists=res.artists,
+        search_query=res.search_query,
+        raw_intent=res.raw_intent,
+        playback_started=res.playback_started,
+        device_id=res.device_id,
+        error=res.error if not res.ok else None,
+        playback_error=res.playback_error,
+    )
 
 
 @app.post("/dnd-improv", response_model=ChatResponse)
@@ -320,6 +552,60 @@ async def dnd_improv(body: DndImprovRequest):
         return ChatResponse(reply=reply)
     except Exception as e:
         logger.exception("D&D improv failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dnd/ask", response_model=ChatResponse)
+async def dnd_ask(body: DndAskRequest):
+    """
+    D&D Q&A: ask a question during a session.
+
+    Uses your existing D&D RAG retrieval (embeddings + map keyword hints) to pull
+    relevant campaign chunks, then answers from those notes.
+    """
+    question = (body.question or "").strip()
+    transcript = (body.transcript or "").strip() if body.transcript else ""
+    use_maps = bool(body.use_maps)
+    if not question:
+        raise HTTPException(status_code=400, detail="question must be non-empty")
+
+    # Retrieval query: question alone works, but transcript makes it much better.
+    retrieval_query = question if not transcript else f"{transcript}\n\n--- Question ---\n{question}"
+
+    try:
+        # Reduce token bloat: fewer chunks, and maps disabled by default.
+        ctx = get_rag_context(
+            retrieval_query,
+            top_k_text=4,
+            max_maps=1 if use_maps else 0,
+        )
+        # Hard truncate notes to keep the request safely under LM Studio's token limits.
+        notes_text = (ctx.notes_text or "").strip()
+        if len(notes_text) > 8000:
+            notes_text = notes_text[:8000] + "\n\n[notes truncated]"
+        image_data_urls = (
+            load_images_as_data_urls(ctx.image_paths) if (use_maps and ctx.image_paths) else []
+        )
+        prompt = (
+            "You are Galadrial, helping a D&D DM.\n"
+            "Answer the DM's question using the campaign notes provided below.\n"
+            "Note that you can find recaps of the campaign in Campaign Recaps.txt\n"
+            "Rules:\n"
+            "- Use plain ASCII text only (no markdown, no emojis).\n"
+            "- If the notes do not contain the answer, say you don't know.\n"
+            "- Do not invent names, titles, or events.\n"
+            "- Keep it short and directly useful for running the session.\n\n"
+            "--- Campaign notes (relevant) ---\n"
+            f"{notes_text}\n\n"
+            "--- DM question ---\n"
+            f"{question}"
+        )
+
+        response = ask_lmstudio_with_images(prompt, image_data_urls)
+        reply = (response.get("output") or [{}])[0].get("content", "").strip() or "No response."
+        return ChatResponse(reply=reply)
+    except Exception as e:
+        logger.exception("D&D ask failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -379,8 +665,10 @@ async def stt_audio(file: UploadFile = File(...)):
                 )
                 return " ".join((seg.text or "").strip() for seg in segments).strip()
 
+            tr0 = time.perf_counter()
             transcript = await asyncio.to_thread(_do_transcribe)
-        return SttResponse(transcript=transcript or "")
+            tr_ms = (time.perf_counter() - tr0) * 1000
+        return SttResponse(transcript=transcript or "", transcribe_server_ms=round(tr_ms, 1))
     finally:
         if tmp_path:
             try:
@@ -393,6 +681,26 @@ async def stt_audio(file: UploadFile = File(...)):
 async def health():
     """Simple health check for connectivity."""
     return {"status": "ok"}
+
+
+@app.get("/benchmark/hotdogs", response_model=BenchmarkResponse)
+async def benchmark_hotdogs():
+    """
+    Run a consistent benchmark prompt and return assistant reply + timing breakdown.
+    """
+    prompt = "How many hotdogs does it take end-to-end to reach the moon?"
+    timing_out: dict = {}
+    reply = handle_message(
+        prompt,
+        log_fn=_log_event,
+        user_name="Benchmark",
+        timing_out=timing_out,
+    )
+    return BenchmarkResponse(
+        prompt=prompt,
+        reply=_sanitize_app_reply(reply or ""),
+        timing=timing_out or None,
+    )
 
 
 @app.get("/lights/nanoleaf/scenes")
@@ -433,6 +741,53 @@ async def lights_auto_status():
     return {"success": True, "auto_sync_live": is_auto_lighting_sync_live()}
 
 
+@app.get("/lights/diagnostic")
+async def lights_diagnostic():
+    """
+    One JSON snapshot of Govee + Nanoleaf + auto-sync so you can verify behavior without
+    walking to the room. Open in a browser: http://localhost:8000/lights/diagnostic
+    """
+    out: dict = {
+        "success": True,
+        "hint": "auto_sync_live=false: Nanoleaf time-sync thread stopped. "
+        "POST /chat uses an instant ack for simple lighting only; custom animations wait for the full reply. "
+        "govee.mode (if present) comes from your Govee /status.",
+        "simple_lighting_instant_ack": True,
+        "full_chat_for_custom_animations": True,
+        "auto_sync_live": is_auto_lighting_sync_live(),
+        "govee": {},
+        "nanoleaf": {},
+    }
+    try:
+        out["govee"] = get_lights_state()
+    except LightsClientError as e:
+        out["govee"] = {"error": str(e)}
+    try:
+        token = get_nanoleaf_token()
+        base = f"http://{NANOLEAF_IP}:16021/api/v1/{token}"
+        st = requests.get(f"{base}/state", timeout=5)
+        out["nanoleaf"]["state_http"] = st.status_code
+        if st.ok:
+            data = st.json()
+            if isinstance(data, dict):
+                on_v = (data.get("on") or {}).get("value")
+                bri_v = (data.get("brightness") or {}).get("value")
+                out["nanoleaf"]["on"] = bool(on_v) if on_v is not None else None
+                out["nanoleaf"]["brightness_pct"] = (
+                    int(bri_v) if isinstance(bri_v, (int, float)) else bri_v
+                )
+        sel = requests.get(f"{base}/effects/select", timeout=5)
+        out["nanoleaf"]["select_http"] = sel.status_code
+        if sel.ok:
+            j = sel.json()
+            if isinstance(j, dict):
+                out["nanoleaf"]["selected_effect"] = j.get("select")
+    except Exception as e:
+        out["nanoleaf"]["error"] = str(e)
+    out["nanoleaf"]["last_flow_attempt"] = get_last_flow_attempt()
+    return out
+
+
 @app.post("/lights/govee/brightness")
 async def lights_govee_brightness(body: GoveeBrightnessRequest):
     try:
@@ -459,11 +814,12 @@ async def lights_nanoleaf_state(body: NanoleafStateRequest):
     if state not in ("on", "off"):
         raise HTTPException(status_code=400, detail="state must be 'on' or 'off'")
     try:
+        stop_auto_lighting_sync(log_fn=_log_event)
         if state == "on":
             turn_on()
         else:
             turn_off()
-        return {"success": True, "state": state}
+        return {"success": True, "state": state, "auto_sync_live": is_auto_lighting_sync_live()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -476,7 +832,7 @@ async def lights_nanoleaf_scene(body: NanoleafSceneRequest):
         raise HTTPException(status_code=400, detail="scene must be non-empty")
     try:
         set_effect(scene)
-        return {"success": True, "scene": scene}
+        return {"success": True, "scene": scene, "auto_sync_live": is_auto_lighting_sync_live()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -484,9 +840,10 @@ async def lights_nanoleaf_scene(body: NanoleafSceneRequest):
 @app.post("/lights/nanoleaf/brightness")
 async def lights_nanoleaf_brightness(body: NanoleafBrightnessRequest):
     try:
+        stop_auto_lighting_sync(log_fn=_log_event)
         level = max(0, min(100, int(body.brightness)))
         set_nanoleaf_brightness(level)
-        return {"success": True, "brightness": level}
+        return {"success": True, "brightness": level, "auto_sync_live": is_auto_lighting_sync_live()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -506,7 +863,12 @@ async def lights_nanoleaf_status():
         bri_val = ((data.get("brightness") or {}).get("value"))
         state = "on" if bool(on_val) else "off"
         brightness = int(bri_val) if isinstance(bri_val, (int, float)) else None
-        return {"success": True, "state": state, "brightness": brightness}
+        return {
+            "success": True,
+            "state": state,
+            "brightness": brightness,
+            "auto_sync_live": is_auto_lighting_sync_live(),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -609,15 +971,34 @@ async def weather_ui():
     """Structured weather payload for mobile weather tab UI."""
     try:
         payload = get_weather_ui_payload(hours=12)
+        try:
+            day_summary = get_day_weather_forecast_summary()
+        except WeatherClientError:
+            day_summary = None
         return WeatherUiResponse(
             location=str(payload.get("location") or ""),
             current_temp_f=payload.get("current_temp_f"),
             current_desc=str(payload.get("current_desc") or ""),
             current_icon=str(payload.get("current_icon") or "mixed"),
+            day_summary=day_summary,
             hourly=list(payload.get("hourly") or []),
         )
     except WeatherClientError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _merge_chat_timing(
+    *,
+    path: str,
+    server: dict | None = None,
+    extra: dict | None = None,
+) -> dict:
+    out: dict = {"path": path}
+    if server:
+        out["server"] = dict(server)
+    if extra:
+        out.update(extra)
+    return out
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -627,31 +1008,164 @@ async def chat(body: ChatRequest):
     if not message:
         raise HTTPException(status_code=400, detail="message must be non-empty")
     try:
-        # For lighting actions (including alias phrases that expand to light commands):
-        # acknowledge immediately, run in background,
-        # and avoid completion chatter unless there is a failure.
+        # Spotify (explicit phrasing) before generic \"Play …\" so \"… on Spotify\" is not sent to YouTube.
+        if looks_like_spotify_play_request(message):
+            t0 = time.perf_counter()
+            res = await asyncio.to_thread(resolve_spotify_play, message)
+            resolve_ms = (time.perf_counter() - t0) * 1000
+            reply = format_spotify_resolution_reply(res)
+            return ChatResponse(
+                reply=_sanitize_app_reply(reply),
+                spotify=_spotify_play_payload(res),
+                timing=_merge_chat_timing(path="spotify", extra={"resolve_ms": round(resolve_ms, 1)}),
+            )
+        # YouTube \"Play …\" → search → video_id (Pi / player hooks in later).
+        if looks_like_play_music_request(message):
+            t0 = time.perf_counter()
+            res = await asyncio.to_thread(resolve_play_to_video_id, message)
+            resolve_ms = (time.perf_counter() - t0) * 1000
+            reply = format_play_resolution_reply(res)
+            return ChatResponse(
+                reply=_sanitize_app_reply(reply),
+                music=_music_search_payload(res),
+                timing=_merge_chat_timing(path="youtube", extra={"resolve_ms": round(resolve_ms, 1)}),
+            )
+
+        # D&D safety guard: prefer the dedicated D&D page for campaign Q&A.
+        t = message.lower()
+        dnd_terms = ("players", "dm", "table", "campaign", "session", "fort", "commander", "quest", "solria", "ter")
+        lighting_terms = ("lights", "nanoleaf", "govee", "brightness", "color", "animation", "scene")
+        if any(k in t for k in dnd_terms) and not any(k in t for k in lighting_terms):
+            return ChatResponse(
+                reply="For questions about your D&D campaign, open /dnd and use the question box (it searches your campaign notes).",
+                nanoleaf_flow=None,
+                timing=_merge_chat_timing(path="dnd_guard"),
+            )
+
+        # Custom / flow animations: never instant-ack (force_full is redundant with _use_background_lighting_ack).
+        force_full = _needs_full_lighting_chat_sync(message)
+        exp = _lighting_alias_expansion(message)
+        if exp:
+            force_full = force_full or _needs_full_lighting_chat_sync(exp)
+
         is_bg_light, alias_key = _looks_like_background_lighting_action(message)
-        if is_bg_light:
+        if is_bg_light and _use_background_lighting_ack(message) and not force_full:
             threading.Thread(
                 target=_run_background_action,
                 args=(message,),
                 daemon=True,
                 name="galadrial-bg-action",
             ).start()
-            return ChatResponse(reply=_ack_for_lighting_action_with_context(message, alias_key))
+            return ChatResponse(
+                reply=_ack_for_lighting_action_with_context(message, alias_key),
+                nanoleaf_flow=None,
+                timing=_merge_chat_timing(path="lighting_instant_ack"),
+            )
 
         effective_name = (body.user_name or "").strip() or "Guest"
-        reply = handle_message(message, log_fn=_log_event, user_name=effective_name)
+        req_started = time.time()
+        timing_out: dict = {}
+        reply = handle_message(
+            message,
+            log_fn=_log_event,
+            user_name=effective_name,
+            timing_out=timing_out,
+        )
         pending_failure = _pop_async_failure()
         if pending_failure:
-            if reply:
-                reply = f"{pending_failure}\n\n{reply}"
-            else:
-                reply = pending_failure
+            reply = f"{pending_failure}\n\n{reply}" if reply else pending_failure
+        nf = _nanoleaf_flow_fresh_since(req_started)
         reply = _sanitize_app_reply(reply or "")
-        return ChatResponse(reply=reply or "No response.")
+        return ChatResponse(
+            reply=reply or "No response.",
+            nanoleaf_flow=nf,
+            timing=_merge_chat_timing(path="chat", server=timing_out or None),
+        )
     except Exception as e:
         logger.exception("Chat failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/music/prepare", response_model=MusicPrepareResponse)
+async def music_prepare(body: MusicPrepareRequest):
+    """
+    Resolve \"Play …\" → YouTube search → ``video_id``. Same as POST /chat for play phrases,
+    without the rest of routing. (HTTP call to your Pi is not wired here yet.)
+    """
+    phrase = (body.phrase or "").strip()
+    if not phrase:
+        raise HTTPException(status_code=400, detail="phrase must be non-empty")
+    if not looks_like_play_music_request(phrase):
+        raise HTTPException(
+            status_code=400,
+            detail='phrase must look like a play request (e.g. "Play artist name")',
+        )
+    try:
+        res = await asyncio.to_thread(resolve_play_to_video_id, phrase)
+        return MusicPrepareResponse(
+            reply=_sanitize_app_reply(format_play_resolution_reply(res)),
+            music=_music_search_payload(res),
+        )
+    except Exception as e:
+        logger.exception("music/prepare failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/music/spotify/devices")
+async def music_spotify_devices():
+    """
+    List Spotify Connect devices (find your Pi / librespot ``id`` for SPOTIFY_DEVICE_ID).
+    Requires Spotify app credentials and a completed login (token cache). Does not start OAuth
+    in the browser (that would block this request); run ``python -m music.spotify_auth`` once first.
+    """
+    if not spotify_credentials_configured():
+        return {"configured": False, "authorized": False, "devices": [], "hint": "Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET."}
+    if not spotify_has_cached_token():
+        return {
+            "configured": True,
+            "authorized": False,
+            "devices": [],
+            "hint": "Run once on this PC: python -m music.spotify_auth (then reload this page).",
+        }
+    try:
+        devices = await asyncio.to_thread(list_connect_devices)
+        return {"configured": True, "authorized": True, "devices": devices}
+    except SpotifyAuthRequiredError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except SpotifyNotConfiguredError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("music/spotify/devices failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/music/spotify/prepare", response_model=SpotifyPrepareResponse)
+async def music_spotify_prepare(body: SpotifyPrepareRequest):
+    """
+    Resolve a Spotify-specific play phrase → search + optional Connect playback (same as /chat branch).
+    """
+    phrase = (body.phrase or "").strip()
+    if not phrase:
+        raise HTTPException(status_code=400, detail="phrase must be non-empty")
+    if not looks_like_spotify_play_request(phrase):
+        raise HTTPException(
+            status_code=400,
+            detail='phrase must look like a Spotify request, e.g. "Play chill metal on Spotify" or "Spotify play …"',
+        )
+    try:
+        res = await asyncio.to_thread(
+            resolve_spotify_play,
+            phrase,
+            skip_llm_refinement=body.skip_llm_refinement,
+            attempt_playback=body.attempt_playback,
+            device_id=body.device_id,
+        )
+        return SpotifyPrepareResponse(
+            reply=_sanitize_app_reply(format_spotify_resolution_reply(res)),
+            spotify=_spotify_play_payload(res),
+        )
+    except Exception as e:
+        logger.exception("music/spotify/prepare failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -716,10 +1230,21 @@ def get_client_html() -> str:
     button:hover { background: #e0a33a; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
     .error { color: #e55; }
+    #profileWrap { padding: 0 1rem 0.5rem; font-size: 0.78rem; color: #9a9fb2; }
+    #profileBar { display: flex; height: 10px; border-radius: 4px; overflow: hidden; background: #222733; margin-top: 0.35rem; }
+    #profileLegend { margin-top: 0.35rem; font-family: ui-monospace, monospace; font-size: 0.72rem; line-height: 1.45; color: #cdd0e0; }
   </style>
 </head>
 <body>
   <h1>Galadrial</h1>
+  <div id="profileWrap" style="display: none;">
+    <label style="display: flex; align-items: center; gap: 0.45rem; margin-bottom: 0.25rem;">
+      <input type="checkbox" id="showProfile" checked />
+      <span>Response profile</span>
+    </label>
+    <div id="profileBar"></div>
+    <div id="profileLegend"></div>
+  </div>
   <div id="tts" style="padding: 0 1rem 0.5rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
     <label style="display:flex; gap:0.4rem; align-items:center; color:#cdd0e0; font-size:0.95rem;">
       <input type="checkbox" id="speakToggle" checked />
@@ -741,6 +1266,77 @@ def get_client_html() -> str:
     const micBtn = document.getElementById('mic');
     const speakToggle = document.getElementById('speakToggle');
     const voiceSelect = document.getElementById('voiceSelect');
+    const profileWrap = document.getElementById('profileWrap');
+    const showProfile = document.getElementById('showProfile');
+    const profileBar = document.getElementById('profileBar');
+    const profileLegend = document.getElementById('profileLegend');
+    let _lastProfileContext = { serverTiming: null, local: {} };
+
+    function _ms(n) {
+      if (n == null || n === undefined || Number.isNaN(Number(n))) return null;
+      const x = Math.round(Number(n));
+      return x < 0 ? null : x;
+    }
+
+    function renderResponseProfile(serverTiming, localExtra) {
+      if (!showProfile || !showProfile.checked || !profileBar || !profileLegend) {
+        if (profileWrap) profileWrap.style.display = 'none';
+        return;
+      }
+      const s = (serverTiming && serverTiming.server) || {};
+      const loc = localExtra || {};
+      const segs = [];
+      const rec = _ms(loc.recording_ms);
+      const tr = _ms(loc.transcribe_ms);
+      const chat = _ms(loc.chat_fetch_ms);
+      const tts = _ms(loc.tts_ms);
+      const rtr = _ms(s.router_llm_ms);
+      const rep = _ms(s.reply_llm_ms);
+      const oth = _ms(s.other_ms);
+      const tot = _ms(s.total_ms);
+      if (rec != null) segs.push({ key: 'RECORD', ms: rec, color: '#4a90d9' });
+      if (tr != null) segs.push({ key: 'TRANSCRIBE', ms: tr, color: '#9b59b6' });
+      if (serverTiming && serverTiming.resolve_ms != null) {
+        const rm = _ms(serverTiming.resolve_ms);
+        if (rm != null) segs.push({ key: 'RESOLVE', ms: rm, color: '#3498db' });
+      }
+      if (rtr != null && rtr > 0) segs.push({ key: 'ROUTER_LLM', ms: rtr, color: '#2ecc71' });
+      if (rep != null && rep > 0) segs.push({ key: 'REPLY_LLM', ms: rep, color: '#1abc9c' });
+      if (oth != null && oth > 0) segs.push({ key: 'OTHER', ms: oth, color: '#7f8c8d' });
+      if (tts != null) segs.push({ key: 'TTS', ms: tts, color: '#e8a088' });
+      const sum = segs.reduce((a, b) => a + b.ms, 0);
+      if (!sum && tot == null && !(serverTiming && serverTiming.path)) {
+        if (profileWrap) profileWrap.style.display = 'none';
+        return;
+      }
+      profileWrap.style.display = 'block';
+      profileBar.innerHTML = '';
+      if (sum > 0) {
+        segs.forEach((seg) => {
+          const d = document.createElement('div');
+          d.style.width = ((seg.ms / sum) * 100).toFixed(2) + '%';
+          d.style.background = seg.color;
+          d.style.minWidth = seg.ms > 0 ? '3px' : '0';
+          d.title = seg.key + ': ' + seg.ms + 'ms';
+          profileBar.appendChild(d);
+        });
+      }
+      let leg = '';
+      segs.forEach((seg) => {
+        leg += '\\u25a0 ' + seg.key + ' ' + seg.ms + 'ms  ';
+      });
+      if (chat != null) leg += '/chat RTT (client) ' + chat + 'ms  ';
+      if (tot != null) leg += ' | SERVER total ' + tot + 'ms';
+      if (loc.transcribe_server_ms != null) leg += ' | Whisper (server) ' + Math.round(loc.transcribe_server_ms) + 'ms';
+      if (serverTiming && serverTiming.path) leg += ' | path: ' + serverTiming.path;
+      profileLegend.textContent = leg.trim();
+    }
+
+    if (showProfile) {
+      showProfile.addEventListener('change', () => {
+        renderResponseProfile(_lastProfileContext.serverTiming, _lastProfileContext.local);
+      });
+    }
 
     function _stripGaladrialPrefix(text) {
       const t = (text || '').toString().trim();
@@ -754,8 +1350,6 @@ def get_client_html() -> str:
       if (!t) return;
       try {
         window.speechSynthesis.cancel();
-        // On some mobile browsers, the voice list updates only after TTS is used.
-        // Re-populate right before speaking so newly installed voices appear.
         populateVoices();
         const utter = new SpeechSynthesisUtterance(t);
         const voices = window.speechSynthesis.getVoices() || [];
@@ -766,6 +1360,13 @@ def get_client_html() -> str:
             if (v.lang) utter.lang = v.lang;
           }
         }
+        utter.onstart = function () { utter._t0 = performance.now(); };
+        utter.onend = function () {
+          if (utter._t0 != null) {
+            _lastProfileContext.local.tts_ms = performance.now() - utter._t0;
+            renderResponseProfile(_lastProfileContext.serverTiming, _lastProfileContext.local);
+          }
+        };
         window.speechSynthesis.speak(utter);
       } catch (e) {
         // ignore speech errors
@@ -810,13 +1411,13 @@ def get_client_html() -> str:
       });
     }
 
-    function append(sender, text, isError) {
+    function append(sender, text, isError, skipTts) {
       const div = document.createElement('div');
       div.className = sender + (isError ? ' error' : '');
       div.textContent = (sender === 'you' ? 'You: ' : 'Galadrial: ') + text;
       log.appendChild(div);
       log.scrollTop = log.scrollHeight;
-      if (sender === 'assistant' && !isError) speak(text);
+      if (sender === 'assistant' && !isError && !skipTts) speak(text);
     }
 
     form.addEventListener('submit', async (e) => {
@@ -827,17 +1428,36 @@ def get_client_html() -> str:
       append('you', message);
       sendBtn.disabled = true;
       try {
+        const tChat0 = performance.now();
         const r = await fetch('/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message })
         });
+        const chatFetchMs = performance.now() - tChat0;
         const data = await r.json().catch(() => ({}));
         if (!r.ok) {
           append('assistant', data.detail || r.statusText || 'Request failed', true);
           return;
         }
+        const localExtra = { chat_fetch_ms: chatFetchMs };
+        if (window.__voiceSeg) {
+          Object.assign(localExtra, window.__voiceSeg);
+          window.__voiceSeg = null;
+        }
+        _lastProfileContext = { serverTiming: data.timing || null, local: localExtra };
+        renderResponseProfile(data.timing, localExtra);
         append('assistant', data.reply || 'No response.');
+        if (data.music && data.music.video_id) {
+          append('assistant', 'YouTube video id: ' + data.music.video_id, false, true);
+        }
+        if (data.spotify && data.spotify.uri) {
+          const s = data.spotify;
+          let line = 'Spotify ' + (s.kind || 'track') + ': ' + (s.name || s.uri);
+          if (s.playback_started) line += ' (playback started)';
+          else if (s.playback_error) line += ' (playback: ' + s.playback_error + ')';
+          append('assistant', line, false, true);
+        }
       } catch (err) {
         append('assistant', err.message || 'Network error', true);
       } finally {
@@ -868,10 +1488,16 @@ def get_client_html() -> str:
       const fd = new FormData();
       const ext = mimeType && mimeType.toLowerCase().includes('ogg') ? 'ogg' : 'webm';
       fd.append('file', blob, `mic.${ext}`);
+      const t0 = performance.now();
       const r = await fetch('/stt', { method: 'POST', body: fd });
+      const wallMs = performance.now() - t0;
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.detail || r.statusText || 'STT failed');
-      return (data.transcript || '').trim();
+      return {
+        transcript: (data.transcript || '').trim(),
+        transcribe_ms: wallMs,
+        transcribe_server_ms: data.transcribe_server_ms,
+      };
     }
 
     async function _startRecording() {
@@ -879,6 +1505,7 @@ def get_client_html() -> str:
       micBtn.disabled = true;
       sendBtn.disabled = true;
       micBtn.textContent = 'Listening...';
+      window.__recordStart = performance.now();
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStream = stream;
@@ -901,7 +1528,15 @@ def get_client_html() -> str:
           sendBtn.disabled = false;
 
           if (!blob.size) return;
-          const transcript = await _transcribeBlob(blob, currentMimeType);
+          const recMs = window.__recordStart != null ? (performance.now() - window.__recordStart) : null;
+          window.__recordStart = null;
+          const tr = await _transcribeBlob(blob, currentMimeType);
+          const transcript = tr.transcript;
+          window.__voiceSeg = {
+            recording_ms: recMs,
+            transcribe_ms: tr.transcribe_ms,
+            transcribe_server_ms: tr.transcribe_server_ms,
+          };
           if (!transcript) return;
           input.value = transcript;
           if (input.value.trim()) {
@@ -988,8 +1623,8 @@ def get_dnd_html() -> str:
     label { display: block; margin: 0.5rem 1rem 0; font-size: 0.9rem; color: #9a9fb2; }
     #transcript {
       flex: 1;
-      min-height: 120px;
-      padding: 1rem;
+      min-height: 60px;
+      padding: 0.75rem;
       margin: 0.5rem 1rem 1rem;
       background: #11141a;
       border: 1px solid #222733;
@@ -999,6 +1634,19 @@ def get_dnd_html() -> str:
       resize: vertical;
     }
     #transcript:focus { outline: none; border-color: #f0b34a; }
+    #question {
+      flex: 1;
+      min-height: 60px;
+      padding: 0.75rem;
+      margin: 0.5rem 1rem 1rem;
+      background: #11141a;
+      border: 1px solid #222733;
+      border-radius: 8px;
+      color: #f7f7f7;
+      font-size: 0.95rem;
+      resize: vertical;
+    }
+    #question:focus { outline: none; border-color: #f0b34a; }
     #reply {
       padding: 1rem;
       margin: 0 1rem 1rem;
@@ -1007,7 +1655,7 @@ def get_dnd_html() -> str:
       border-left: 4px solid #f0b34a;
       font-size: 1rem;
       line-height: 1.5;
-      min-height: 60px;
+      min-height: 140px;
     }
     #reply.empty { color: #9a9fb2; }
     .error { color: #e55; }
@@ -1022,13 +1670,26 @@ def get_dnd_html() -> str:
   </div>
   <label for="transcript">Transcript (editable)</label>
   <textarea id="transcript" placeholder="Record or paste the recent table conversation..."></textarea>
+  <label for="question">DM question (editable)</label>
+  <textarea id="question" placeholder="e.g. Who was the commander the players encountered in a fort in Solria Ter?..."></textarea>
+  <div class="controls" style="margin-top: 0.25rem;">
+    <button type="button" id="recordQBtn">Record question</button>
+    <button type="button" id="stopQBtn" disabled class="stop">Stop</button>
+  </div>
+  <div class="controls" style="margin-top: 0.25rem;">
+    <button type="button" id="askBtn">Ask (use campaign notes)</button>
+  </div>
   <label>Read this aloud</label>
   <div id="reply" class="empty">Suggestions will appear here after you send the transcript.</div>
   <script>
     const recordBtn = document.getElementById('recordBtn');
     const stopBtn = document.getElementById('stopBtn');
     const sendBtn = document.getElementById('sendBtn');
+    const recordQBtn = document.getElementById('recordQBtn');
+    const stopQBtn = document.getElementById('stopQBtn');
+    const askBtn = document.getElementById('askBtn');
     const transcript = document.getElementById('transcript');
+    const questionEl = document.getElementById('question');
     const replyEl = document.getElementById('reply');
 
     // Whisper STT: browser records audio, server transcribes, then we fill the editable textarea.
@@ -1036,6 +1697,10 @@ def get_dnd_html() -> str:
     let micStream = null;
     let audioChunks = [];
     let currentMimeType = '';
+    let mediaRecorderQ = null;
+    let micStreamQ = null;
+    let audioChunksQ = [];
+    let currentMimeTypeQ = '';
 
     function _pickMimeType() {
       const candidates = [
@@ -1057,7 +1722,10 @@ def get_dnd_html() -> str:
       const r = await fetch('/stt', { method: 'POST', body: fd });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.detail || r.statusText || 'STT failed');
-      return (data.transcript || '').trim();
+      return {
+        transcript: (data.transcript || '').trim(),
+        transcribe_server_ms: data.transcribe_server_ms,
+      };
     }
 
     if (window.MediaRecorder) {
@@ -1086,8 +1754,8 @@ def get_dnd_html() -> str:
               if (micStream) micStream.getTracks().forEach((t) => t.stop());
               const blob = new Blob(audioChunks, { type: currentMimeType || 'audio/webm' });
               if (!blob.size) return;
-              const text = await _transcribeBlob(blob, currentMimeType);
-              transcript.value = text;
+              const tr = await _transcribeBlob(blob, currentMimeType);
+              transcript.value = tr.transcript;
               replyEl.textContent = 'Transcript ready.';
               replyEl.classList.remove('error');
             } catch (e) {
@@ -1117,10 +1785,69 @@ def get_dnd_html() -> str:
           mediaRecorder.stop();
         }
       });
+
+      recordQBtn.addEventListener('click', async () => {
+        try {
+          recordQBtn.disabled = true;
+          stopQBtn.disabled = false;
+          replyEl.textContent = 'Recording question...';
+          replyEl.classList.remove('empty');
+          replyEl.classList.remove('error');
+
+          questionEl.value = questionEl.value || '';
+          audioChunksQ = [];
+          currentMimeTypeQ = _pickMimeType();
+
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          micStreamQ = stream;
+          const options = {};
+          if (currentMimeTypeQ) options.mimeType = currentMimeTypeQ;
+          mediaRecorderQ = new MediaRecorder(stream, options);
+          mediaRecorderQ.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) audioChunksQ.push(e.data);
+          };
+          mediaRecorderQ.onstop = async () => {
+            try {
+              if (micStreamQ) micStreamQ.getTracks().forEach((t) => t.stop());
+              const blob = new Blob(audioChunksQ, { type: currentMimeTypeQ || 'audio/webm' });
+              if (!blob.size) return;
+              const tr = await _transcribeBlob(blob, currentMimeTypeQ);
+              questionEl.value = tr.transcript;
+              replyEl.textContent = 'Question transcript ready.';
+              replyEl.classList.remove('error');
+            } catch (e) {
+              replyEl.textContent = 'Question transcription failed: ' + ((e && e.message) ? e.message : String(e));
+              replyEl.classList.add('error');
+            } finally {
+              recordQBtn.disabled = false;
+              stopQBtn.disabled = true;
+              mediaRecorderQ = null;
+              micStreamQ = null;
+              audioChunksQ = [];
+              currentMimeTypeQ = '';
+            }
+          };
+          mediaRecorderQ.start();
+        } catch (e) {
+          recordQBtn.disabled = false;
+          stopQBtn.disabled = true;
+          replyEl.textContent = 'Question mic start failed: ' + ((e && e.message) ? e.message : String(e));
+          replyEl.classList.add('error');
+        }
+      });
+
+      stopQBtn.addEventListener('click', () => {
+        if (mediaRecorderQ && mediaRecorderQ.state === 'recording') {
+          mediaRecorderQ.stop();
+        }
+      });
     } else {
       recordBtn.textContent = 'Record (unsupported)';
       recordBtn.disabled = true;
       stopBtn.disabled = true;
+      recordQBtn.textContent = 'Record question (unsupported)';
+      recordQBtn.disabled = true;
+      stopQBtn.disabled = true;
     }
 
     sendBtn.addEventListener('click', async () => {
@@ -1148,6 +1875,35 @@ def get_dnd_html() -> str:
         replyEl.classList.add('error');
       } finally {
         sendBtn.disabled = false;
+      }
+    });
+
+    askBtn.addEventListener('click', async () => {
+      const q = (questionEl.value || '').trim();
+      const tr = (transcript.value || '').trim();
+      if (!q) return;
+      askBtn.disabled = true;
+      replyEl.textContent = 'Thinking...';
+      replyEl.classList.remove('empty');
+      try {
+        const r = await fetch('/dnd/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: q, transcript: tr || null })
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          replyEl.textContent = data.detail || r.statusText || 'Request failed';
+          replyEl.classList.add('error');
+          return;
+        }
+        replyEl.textContent = data.reply || 'No response.';
+        replyEl.classList.remove('error');
+      } catch (err) {
+        replyEl.textContent = err.message || 'Network error';
+        replyEl.classList.add('error');
+      } finally {
+        askBtn.disabled = false;
       }
     });
   </script>

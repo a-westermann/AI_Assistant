@@ -1,0 +1,6 @@
+
+(venv) H:\Coding\AI_assistant>call venv\Scripts\activate.bat 
+
+(venv) H:\Coding\AI_assistant>start uvicorn api_server:app --host 0.0.0.0 --port 8000 
+
+(venv) H:\Coding\AI_assistant>python chat_gui.py 

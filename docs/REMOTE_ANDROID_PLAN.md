@@ -16,12 +16,12 @@ Use Galadrial from a web browser (or later from Android): the client sends a mes
 │                     │         private network     │                                      │
 │  • Client app       │   POST /chat {"message": …}  │  • FastAPI server (e.g. :8000)       │
 │  • Tailscale app    │   ◄── {"reply": "…"}        │  • LM Studio (localhost:1234)        │
-│                     │                              │  • Gmail, lights, Plex sync (local)  │
+│                     │                              │  • Lights, weather, Plex sync (local)│
 └─────────────────────┘                              └──────────────────────────────────────┘
 ```
 
 - **Android**: Only needs to HTTP POST the user message and show the reply. No LLM or tools on the phone.
-- **PC**: Runs FastAPI (same process can also run the Tk desktop app, or you run the server separately). FastAPI calls LM Studio at `localhost:1234` and runs lights/Gmail/Plex tools on the PC.
+- **PC**: Runs FastAPI (same process can also run the Tk desktop app, or you run the server separately). FastAPI calls LM Studio at `localhost:1234` and runs lights, weather, memory, shopping list, and Plex tools on the PC.
 - **Tailscale (optional, later):** When you want remote access, both devices join the same Tailscale network. Android would use the PC’s Tailscale IP (e.g. `http://100.x.x.x:8000`). For now, use **http://localhost:8000/** on the PC only.
 
 ---
@@ -31,7 +31,6 @@ Use Galadrial from a web browser (or later from Android): the client sends a mes
 | Component              | Where it runs | Notes |
 |------------------------|---------------|--------|
 | LM Studio              | PC            | Already `localhost:1234` |
-| Gmail (IMAP)           | PC            | Env vars on PC |
 | Lights API client      | PC            | Calls your Govee automation from PC |
 | Plex sync script       | PC            | Path on PC |
 | Routing + tools + LLM  | PC            | Inside FastAPI (reuse same logic as GUI) |
@@ -69,8 +68,8 @@ Right now routing, tools, and the model call live inside `ChatApp` in `chat_gui.
 - New module, e.g. `assistant_engine.py`, that has:
   - `route(user_text: str) -> dict`
   - `handle_message(user_text: str) -> str`  
-    - Runs route → runs tool if needed (lights, Gmail, Plex) → builds prompt → calls `ask_lmstudio` → returns the single reply string.
-- Tools stay in existing modules (`lights_client`, `gmail_client`); the engine imports them and calls them.
+    - Runs route → runs tool if needed (lights, Plex, etc.) → builds prompt → calls `ask_lmstudio` → returns the single reply string.
+- Tools stay in existing modules (`lighting.lights_client`, `misc_tools.weather_client`, etc.); the engine imports them and calls them.
 - “Log” output from the engine can go to a list or logger instead of `_log_event`; FastAPI can log the same to stdout.
 - `chat_gui.py` then:
   - Imports the engine (or shares the same routing/handle logic).
@@ -139,7 +138,7 @@ When you want to use the web client from your phone or another device:
 
 ## 8. Summary
 
-- **PC**: FastAPI server + LM Studio + existing tools (Gmail, lights, Plex). One “engine” used by both the desktop GUI and the API.
+- **PC**: FastAPI server + LM Studio + existing tools (lights, weather, Plex, etc.). One “engine” used by both the desktop GUI and the API.
 - **Android**: Thin client that sends the message and shows the reply over Tailscale.
 - **Tailscale**: Private network so the phone can reach the PC without opening your home router.
 

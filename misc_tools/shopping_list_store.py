@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
 ITEMS_PATH = os.path.join(DATA_DIR, "shopping_list.json")
 SORT_ORDER_PATH = os.path.join(DATA_DIR, "shopping_sort_order.json")
 

@@ -6,13 +6,12 @@ import tkinter as tk
 from tkinter import scrolledtext
 
 from llm import ask_lmstudio
-from lights_client import (
+from lighting.lights_client import (
     get_lights_state,
     toggle_all_lights,
     LightsClientError,
     set_lights_auto,
 )
-from gmail_client import search_gmail, GmailClientError
 from assistant_engine import AssistantEngine
 
 # Plex sync app: run script in background and notify when done
@@ -51,7 +50,7 @@ class ChatApp:
         # simple conversational state for routing and context
         self.last_route: dict | None = None
         self.last_user_message: str | None = None
-        # Use shared assistant engine for routing + tools (lights.set_scene, Nanoleaf, Gmail, etc.)
+        # Use shared assistant engine for routing + tools (lights, Nanoleaf, memory, weather, etc.)
         self._assistant_engine = AssistantEngine(log_fn=self._log_event)
 
         self._configure_root()
@@ -652,11 +651,11 @@ class ChatApp:
                 "system note telling you that the lights were set to a state, you may "
                 "speak as if that action has already been performed.\n"
                 "- The app may also display separate System messages with the results "
-                "of tools (for example, Gmail searches, Plex sync). Those System messages are the "
+                "of tools (for example, Plex sync). Those System messages are the "
                 "source of truth about my real data.\n\n"
                 "CRITICAL SAFETY RULES:\n"
                 "- Do NOT invent or guess specific facts about my personal data, such "
-                "as emails, literary magazine acceptances, bank balances, calendar "
+                "as literary magazine acceptances, bank balances, calendar "
                 "events, or file contents.\n"
                 "- If you are not given an explicit System note or tool result that "
                 "contains those facts, you must say that you don't know instead of "
@@ -734,192 +733,6 @@ class ChatApp:
             err = stderr.strip() or stdout.strip() or f"Exit code {returncode}"
             msg = f"Plex sync finished with an error: {err}"
             self._log_event(f"Plex sync error: {err}")
-
-    # ----- Gmail integration --------------------------------------------------
-
-    def _interpret_email_list(self, user_question: str, messages: list[dict]) -> str | None:
-        """Ask the model which emails match the user's question; return its reply or None on failure."""
-        # Cap how many we send to the model so the prompt doesn't time out
-        max_for_interpretation = 45
-        if len(messages) > max_for_interpretation:
-            messages = messages[:max_for_interpretation]
-        if not messages:
-            try:
-                response = ask_lmstudio(
-                    "The user asked about their email:\n\n"
-                    f'"{user_question}"\n\n'
-                    "We searched their Gmail and found no messages matching the search. "
-                    "Reply in one short sentence that no matching emails were found."
-                )
-                return (response.get("output") or [{}])[0].get("content", "").strip() or None
-            except Exception as e:
-                self._log_event(f"Interpretation (no results) failed: {e}")
-                return None
-        lines = []
-        for i, m in enumerate(messages, 1):
-            from_ = m.get("from", "")
-            subj = m.get("subject", "")
-            date = m.get("date", "")
-            snippet = m.get("snippet", "")
-            parts = [f"{i}. From: {from_}", f"Subject: {subj}"]
-            if date:
-                parts.append(f"Date: {date}")
-            line = " | ".join(parts)
-            if snippet:
-                line += "\n   Snippet: " + snippet
-            lines.append(line)
-        email_list_text = "\n".join(lines)
-        prompt = (
-            "The user asked about their email:\n\n"
-            f'"{user_question}"\n\n'
-            "Here are emails from their inbox (newest first), with a short body snippet for each:\n\n"
-            f"{email_list_text}\n\n"
-            "Which of these emails match what they're looking for? Use the snippet to recognize "
-            "acceptances: e.g. 'would love to feature', 'we'd like to publish', 'accept your story', "
-            "'contract', 'feature it', 'work with me on edits', 'I can publish it', 'publish it in the [issue]', "
-            "'earliest available opening', 'would you be willing to work with me'—even if the subject doesn't say 'accepted'. "
-            "If one or more match, say which one(s) and give the most relevant detail. "
-            "If none match, say so briefly. Reply in 1–4 concise sentences; do not invent any emails not in the list."
-        )
-        try:
-            response = ask_lmstudio(prompt)
-            text = (response.get("output") or [{}])[0].get("content", "").strip()
-            return text or None
-        except Exception as e:
-            self._log_event(f"Interpretation failed: {e}")
-            return None
-
-    def _search_gmail_worker(
-        self,
-        query: str,
-        scope: str,
-        result_type: str,
-        category: str | None,
-        user_question: str = "",
-        broad_search_terms: list[str] | None = None,
-    ) -> None:
-        """Search Gmail via IMAP; for list type, optionally use broad OR search and LLM interpretation."""
-        try:
-            # For list type with broad terms, search with OR to get more candidates.
-            # Use only submission-relevant terms so we don't pull in marketing (Venmo "review",
-            # Wells Fargo "contract", etc.).
-            _GENERIC_BROAD_TERMS = {"review", "feature", "contract"}
-            search_query = query
-            max_results = 20
-            if result_type == "list" and broad_search_terms:
-                narrow_terms = [
-                    t for t in broad_search_terms
-                    if t.lower() not in _GENERIC_BROAD_TERMS
-                ]
-                if not narrow_terms:
-                    narrow_terms = list(broad_search_terms)
-                search_query = " OR ".join(narrow_terms)
-                max_results = 80
-                self._log_event(
-                    f"Searching Gmail with broad terms (OR) for interpretation: {search_query!r}"
-                )
-            self._log_event(
-                f"Searching Gmail (scope={scope}, result={result_type}, category={category}) "
-                f"for messages matching: {search_query!r}"
-            )
-            count_only = result_type == "count"
-            messages = search_gmail(
-                query=search_query,
-                scope=scope,
-                max_results=max_results,
-                category=category,
-                count_only=count_only,
-            )  # type: ignore[arg-type]
-
-            # When count_only, search_gmail may return [{"_count": N, "_thread_count": T}]
-            # _thread_count = conversations (matches the tab badge, e.g. "Updates 3")
-            total = len(messages)
-            thread_count = None
-            if count_only and messages and isinstance(messages[0], dict):
-                m0 = messages[0]
-                if "_count" in m0:
-                    total = int(m0["_count"])
-                if "_thread_count" in m0:
-                    thread_count = int(m0["_thread_count"])
-                if "_debug" in m0:
-                    for entry in m0["_debug"]:
-                        self._log_event(
-                            f"Gmail debug: {entry.get('label', '?')} -> "
-                            f"count={entry.get('count', '?')} status={entry.get('status', '?')} "
-                            f"err={entry.get('error', '')} rsp={entry.get('response_preview', '')}"
-                        )
-
-            if total == 0 and (thread_count is None or thread_count == 0):
-                if result_type == "count" and scope == "unread":
-                    summary = "You have 0 unread Gmail messages."
-                elif result_type == "count":
-                    summary = "You have 0 Gmail messages matching that query."
-                else:
-                    if user_question.strip():
-                        interpretation = self._interpret_email_list(user_question.strip(), [])
-                        summary = interpretation or "No matching Gmail messages found."
-                    else:
-                        summary = "No matching Gmail messages found."
-            else:
-                if result_type == "count":
-                    if thread_count is not None and category:
-                        summary = (
-                            f"You have {thread_count} unread conversation(s) in {category} "
-                            f"({total:,} message(s))."
-                        )
-                    elif scope == "unread":
-                        summary = (
-                            f"You have {total:,} unread Gmail message(s)."
-                        )
-                    else:
-                        summary = (
-                            f"You have {total:,} Gmail message(s) "
-                            "matching that query."
-                        )
-                else:
-                    # List result: have the model interpret which emails match the user's question
-                    if user_question.strip():
-                        interpretation = self._interpret_email_list(
-                            user_question.strip(), messages
-                        )
-                        if interpretation:
-                            summary = interpretation
-                        else:
-                            # Don't dump a long raw list; give a short fallback so user can retry
-                            self._log_event(
-                                "Interpretation returned empty; showing short fallback."
-                            )
-                            summary = (
-                                f"I found {total} email(s) matching your search but couldn't "
-                                "interpret which one answers your question (model may have timed out). "
-                                "Try asking again, or search your inbox for “Perseid Prophecies”, "
-                                "“acceptance”, or the story title."
-                            )
-                    else:
-                        lines = [
-                            f"- {m.get('from', '')} — {m.get('subject', '')}"
-                            for m in messages
-                        ]
-                        summary = (
-                            f"Found {total} matching Gmail message(s):\n"
-                            + "\n".join(lines)
-                        )
-
-            # Log result to Events only; have the assistant reply in chat
-            self._log_event(summary)
-            self.call_model_and_display(
-                user_question,
-                None,
-                extra_note="The app ran a Gmail search. Use this result to answer the user in one concise message. Do not repeat the raw list; summarize or answer their question.\n\nResult:\n" + summary + "\n\n",
-            )
-        except GmailClientError as e:
-            msg = f"Gmail error: {e}"
-            self._log_event(msg)
-            self.call_model_and_display(
-                user_question,
-                None,
-                extra_note="System note: The app tried to search Gmail but failed. Tell the user briefly that the search failed and they can try again.\n\n",
-            )
 
 
 def main() -> None:
