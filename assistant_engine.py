@@ -51,7 +51,9 @@ from music.play_resolver import (
 )
 from music.spotify_resolver import (
     format_spotify_resolution_reply,
+    looks_like_spotify_pause_request,
     looks_like_spotify_play_request,
+    pause_spotify_playback,
     resolve_spotify_play,
 )
 
@@ -344,6 +346,39 @@ class AssistantEngine:
 
         # Clamp to our forecast helper's supported range (weekday names only).
         return max(0, min(7, int(delta)))
+
+    def _weather_forecast_target_hour(self, text: str) -> int | None:
+        """
+        Parse optional time-of-day from weather query.
+        Supports: noon, midnight, 1pm, 1 pm, 1 p. m., 1:30pm, 13:00.
+        Returns hour in 24h form (0..23), or None if no time mentioned.
+        """
+        t = (text or "").lower()
+        if "noon" in t:
+            return 12
+        if "midnight" in t:
+            return 0
+
+        # Normalize dotted/spaced meridiem forms:
+        # "2 p. m." / "2 p.m." / "2 p m" -> "2 pm"
+        t = re.sub(r"\b([ap])\s*\.?\s*m\.?\b", r"\1m", t)
+
+        # 1pm / 1 pm / 1:30pm / 1:30 pm
+        m12 = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b", t)
+        if m12:
+            hour = int(m12.group(1))
+            ampm = m12.group(3)
+            hour = max(1, min(12, hour))
+            if ampm == "am":
+                return 0 if hour == 12 else hour
+            return 12 if hour == 12 else hour + 12
+
+        # 24h like 13:00
+        m24 = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", t)
+        if m24:
+            return int(m24.group(1))
+
+        return None
 
     def _is_brightness_status_query(self, text: str) -> bool:
         """
@@ -1184,10 +1219,27 @@ Respond with JSON only:
         if self._is_wake_sleep_phrase(t_raw) and re.search(r"\bgood[\s-]*night\b", t_raw):
             return self._run_night_routine(user_text)
 
-        # Spotify (explicit phrasing) before generic "Play …" (YouTube).
+        # Deterministic Spotify pause/stop.
+        if looks_like_spotify_pause_request(user_text):
+            ok, detail, _dev = pause_spotify_playback()
+            if ok:
+                return "Paused Spotify playback."
+            return f"I couldn't pause Spotify playback: {detail or 'unknown error'}."
+
+        # Spotify before generic "Play …" (YouTube).
+        # If Spotify playback can't start and the user did NOT explicitly mention Spotify,
+        # fall back to the existing YouTube pipeline.
+        explicit_spotify = "spotify" in (user_text or "").lower()
         if looks_like_spotify_play_request(user_text):
-            res = resolve_spotify_play(user_text)
-            return format_spotify_resolution_reply(res)
+            sp_res = resolve_spotify_play(user_text)
+            if sp_res.ok and (sp_res.playback_started or explicit_spotify):
+                return format_spotify_resolution_reply(sp_res)
+            # Soft fallback only when the user didn't explicitly ask for Spotify.
+            if not explicit_spotify and looks_like_play_music_request(user_text):
+                res = resolve_play_to_video_id(user_text)
+                return format_play_resolution_reply(res)
+            return format_spotify_resolution_reply(sp_res)
+
         # YouTube "Play …" → search → video_id (pass to Pi / player separately).
         if looks_like_play_music_request(user_text):
             res = resolve_play_to_video_id(user_text)
@@ -1221,7 +1273,11 @@ Respond with JSON only:
         if self._is_weather_forecast_query(user_text):
             try:
                 day_offset = self._weather_forecast_day_offset(user_text)
-                return get_day_weather_forecast_summary(day_offset=day_offset)
+                target_hour = self._weather_forecast_target_hour(user_text)
+                return get_day_weather_forecast_summary(
+                    day_offset=day_offset,
+                    target_hour_24=target_hour,
+                )
             except WeatherClientError as e:
                 emsg = (str(e) or "").strip()
                 if emsg:

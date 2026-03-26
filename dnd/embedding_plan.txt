@@ -1,0 +1,91 @@
+D&D RAG Embedding & Retrieval Improvement Plan
+==============================================
+
+1) Clarify where embeddings come from (current code)
+-----------------------------------------------------
+- Your D&D RAG in `dnd_loader.py` uses:
+  - Python `sentence-transformers` + local model download/caching
+  - Model hardcoded as: `sentence-transformers/all-MiniLM-L6-v2`
+- This does NOT use LM Studio at all.
+- So you do NOT need to "download the model in LM Studio UI".
+- When the code first hits `SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")`,
+  the library will download the weights (once) and cache them locally.
+
+2) Why the AI sometimes says it "doesn't know"
+-----------------------------------------------------
+Typical causes in this pipeline:
+- The correct fact is not in the top-N retrieved chunks (`top_k_text` is currently 4 in `/dnd/ask`).
+- Facts may be split across chunks (chunk size / overlap not ideal for your note structure).
+- The query embedding may be diluted by long transcripts (you currently embed transcript+question as one string).
+- Pure embedding similarity can miss "proper nouns" without lexical help.
+- No reranking step: retrieved chunks might be semantically close but not actually answer-bearing.
+
+3) Highest-impact changes (recommended order)
+----------------------------------------------
+A) Increase retrieval breadth
+   - In `/dnd/ask`, raise `top_k_text` from 4 to 8 (or 6/10 as a quick A/B).
+   - Goal: reduce "answer not retrieved" cases.
+
+B) Separate “question” vs “transcript” for embedding weighting
+   - Current retrieval query: `transcript + question`
+   - Proposed: embed question and transcript separately, then combine scores:
+     - e.g. score = 0.7 * sim(question) + 0.3 * sim(transcript)
+   - Goal: ensure the actual DM question dominates retrieval.
+
+C) Improve chunking
+   - Your current chunking: size=600 chars, overlap=100 chars, split by paragraph boundaries.
+   - Try: larger chunk size (800-1000) and slightly larger overlap (150-200),
+     especially if campaign notes have long scenes/events.
+   - Goal: keep “facts” inside one chunk more often.
+
+D) Add hybrid retrieval (embedding + keyword)
+   - For each question, pull candidates where:
+     - embeddings are top-K, OR
+     - key entities from the question appear in chunk text (proper nouns / locations / NPC names).
+   - Union the sets, then optionally rerank.
+   - Goal: fix proper-noun misses.
+
+E) Rerank the candidate chunks (precision boost)
+   - After getting top candidates, rerank using:
+     - a cross-encoder (best quality), or
+     - a small LLM rerank prompt over short snippets.
+   - Goal: reduce “retrieved but irrelevant” cases.
+
+F) Cache aggressively (performance + consistency)
+   - You already cache the embedding index per campaign folder.
+   - Ensure embeddings are not recomputed per request.
+   - Goal: experimentation without latency/instability.
+
+4) Do we need an embedding model in LM Studio?
+------------------------------------------------
+Not necessary for now, given the current architecture.
+
+Option 1 (recommended for speed): use a stronger sentence-transformers model locally
+- Swap `all-MiniLM-L6-v2` to a stronger retrieval embedding model (still via sentence-transformers).
+- This typically improves recall without changing the rest of the pipeline.
+
+Option 2 (if you want LM Studio specifically): implement LM Studio embeddings
+- You would need:
+  - an LM Studio embedding endpoint call
+  - to compute embeddings for both chunks and queries
+  - and to cache those vectors for the campaign folder
+- This adds integration work and is usually slower than just upgrading the local embedding model.
+
+5) Quick A/B test checklist (small changes first)
+---------------------------------------------------
+1. Keep code the same except:
+   - change `/dnd/ask` top_k_text from 4 -> 8
+2. If still missing:
+   - adjust retrieval query weighting (question dominates)
+3. If chunk boundaries look wrong:
+   - adjust CHUNK_SIZE and CHUNK_OVERLAP in `dnd_loader.py`
+4. If misses are mostly proper nouns:
+   - add lexical/keyword fallback
+
+6) Next info I should ask you for (to tune properly)
+------------------------------------------------------
+- Which endpoint are you asking through?
+  - `/dnd/ask`, `/dnd-improv`, or `/chat`
+- One example question where it said “I don't know”
+- Which campaign notes file (if you know) contains the answer
+

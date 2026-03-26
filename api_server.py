@@ -8,6 +8,8 @@ import logging
 import socket
 import asyncio
 import os
+import hashlib
+import hmac
 import tempfile
 import threading
 import time
@@ -18,7 +20,7 @@ from collections import deque
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -77,7 +79,9 @@ from music.spotify_client import (
 from music.spotify_resolver import (
     SpotifyResolution,
     format_spotify_resolution_reply,
+    looks_like_spotify_pause_request,
     looks_like_spotify_play_request,
+    pause_spotify_playback,
     resolve_spotify_play,
 )
 from misc_tools.shopping_list_store import (
@@ -318,6 +322,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Galadrial API", lifespan=lifespan)
 
+# D&D endpoint lock (simple password + device cookie).
+# Env var:
+# - `DND_PWD`: password required to use `/dnd/ask` and `/dnd-improv`.
+# After successful unlock, we set an HttpOnly cookie so the same browser/device
+# can access without re-entering the password.
+DND_PWD = (os.environ.get("DND_PWD") or "").strip()
+DND_COOKIE_NAME = "galadrial_dnd_authed"
+DND_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30  # 30 days
+DND_PWD_HASH = hashlib.sha256(DND_PWD.encode("utf-8")).hexdigest() if DND_PWD else ""
+
+
+def _dnd_authed_from_request(request: Request) -> bool:
+    if not DND_PWD:
+        return True
+    cookie_val = request.cookies.get(DND_COOKIE_NAME)
+    return bool(cookie_val) and hmac.compare_digest(cookie_val, DND_PWD_HASH)
+
+
+def _require_dnd_authed(request: Request) -> None:
+    if not _dnd_authed_from_request(request):
+        raise HTTPException(status_code=401, detail="D&D is locked. Click the lock icon and enter the password.")
+
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -377,6 +404,10 @@ class DndAskRequest(BaseModel):
     # Maps can cause very large prompts (base64 data urls). For on-the-fly Q&A,
     # we default to notes-only and let you enable maps explicitly later.
     use_maps: bool = False
+
+
+class DndAuthRequest(BaseModel):
+    password: str
 
 
 class SttResponse(BaseModel):
@@ -502,13 +533,39 @@ def _spotify_play_payload(res: SpotifyResolution) -> SpotifyPlayPayload:
     )
 
 
+@app.get("/dnd/auth/status")
+async def dnd_auth_status(request: Request):
+    return {"authed": _dnd_authed_from_request(request)}
+
+
+@app.post("/dnd/auth")
+async def dnd_auth(body: DndAuthRequest, response: Response):
+    if not DND_PWD:
+        return {"ok": True, "authed": True}
+    if not body.password:
+        raise HTTPException(status_code=400, detail="password is required")
+    pwd_hash = hashlib.sha256(body.password.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(pwd_hash, DND_PWD_HASH):
+        raise HTTPException(status_code=401, detail="Incorrect password")
+    response.set_cookie(
+        key=DND_COOKIE_NAME,
+        value=DND_PWD_HASH,
+        max_age=DND_COOKIE_MAX_AGE_SECONDS,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return {"ok": True, "authed": True}
+
+
 @app.post("/dnd-improv", response_model=ChatResponse)
-async def dnd_improv(body: DndImprovRequest):
+async def dnd_improv(body: DndImprovRequest, request: Request):
     """
     D&D improv: send transcript of table conversation, get suggested dialogue to read aloud.
     The LLM first chooses which note chunks and maps are relevant, then we send only those
     and get the dialogue suggestion (two LLM calls).
     """
+    _require_dnd_authed(request)
     transcript = (body.transcript or "").strip()
     try:
         catalog = get_selection_catalog()
@@ -556,13 +613,14 @@ async def dnd_improv(body: DndImprovRequest):
 
 
 @app.post("/dnd/ask", response_model=ChatResponse)
-async def dnd_ask(body: DndAskRequest):
+async def dnd_ask(body: DndAskRequest, request: Request):
     """
     D&D Q&A: ask a question during a session.
 
     Uses your existing D&D RAG retrieval (embeddings + map keyword hints) to pull
     relevant campaign chunks, then answers from those notes.
     """
+    _require_dnd_authed(request)
     question = (body.question or "").strip()
     transcript = (body.transcript or "").strip() if body.transcript else ""
     use_maps = bool(body.use_maps)
@@ -1008,15 +1066,40 @@ async def chat(body: ChatRequest):
     if not message:
         raise HTTPException(status_code=400, detail="message must be non-empty")
     try:
-        # Spotify (explicit phrasing) before generic \"Play …\" so \"… on Spotify\" is not sent to YouTube.
+        if looks_like_spotify_pause_request(message):
+            ok, detail, dev = await asyncio.to_thread(pause_spotify_playback)
+            if ok:
+                return ChatResponse(
+                    reply="Paused Spotify playback.",
+                    spotify=SpotifyPlayPayload(ok=True, kind="control", device_id=dev),
+                    timing=_merge_chat_timing(path="spotify_pause"),
+                )
+            return ChatResponse(
+                reply=_sanitize_app_reply(f"I couldn't pause Spotify playback: {detail or 'unknown error'}"),
+                spotify=SpotifyPlayPayload(ok=False, kind="control", device_id=dev, playback_error=detail),
+                timing=_merge_chat_timing(path="spotify_pause"),
+            )
+
+        # Spotify before generic \"Play …\" so voice/phone requests can still work.
+        explicit_spotify = "spotify" in (message or "").lower()
         if looks_like_spotify_play_request(message):
             t0 = time.perf_counter()
-            res = await asyncio.to_thread(resolve_spotify_play, message)
+            sp_res = await asyncio.to_thread(resolve_spotify_play, message)
             resolve_ms = (time.perf_counter() - t0) * 1000
-            reply = format_spotify_resolution_reply(res)
+            # Soft fallback: if Spotify didn't start and user didn't explicitly ask for Spotify, use YouTube.
+            if (not sp_res.ok or not sp_res.playback_started) and not explicit_spotify and looks_like_play_music_request(message):
+                yt_res = await asyncio.to_thread(resolve_play_to_video_id, message)
+                yt_reply = format_play_resolution_reply(yt_res)
+                yt_payload = _music_search_payload(yt_res)
+                return ChatResponse(
+                    reply=_sanitize_app_reply(yt_reply),
+                    music=yt_payload,
+                    timing=_merge_chat_timing(path="youtube_fallback", extra={"resolve_ms": round(resolve_ms, 1)}),
+                )
+            reply = format_spotify_resolution_reply(sp_res)
             return ChatResponse(
                 reply=_sanitize_app_reply(reply),
-                spotify=_spotify_play_payload(res),
+                spotify=_spotify_play_payload(sp_res),
                 timing=_merge_chat_timing(path="spotify", extra={"resolve_ms": round(resolve_ms, 1)}),
             )
         # YouTube \"Play …\" → search → video_id (Pi / player hooks in later).
@@ -1456,6 +1539,7 @@ def get_client_html() -> str:
           let line = 'Spotify ' + (s.kind || 'track') + ': ' + (s.name || s.uri);
           if (s.playback_started) line += ' (playback started)';
           else if (s.playback_error) line += ' (playback: ' + s.playback_error + ')';
+          if (s.device_id) line += ' [device ' + s.device_id + ']';
           append('assistant', line, false, true);
         }
       } catch (err) {
@@ -1605,8 +1689,43 @@ def get_dnd_html() -> str:
       display: flex;
       flex-direction: column;
     }
-    h1 { margin: 1rem; font-size: 1.25rem; color: #f0b34a; }
+    .topRow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1rem 0;
+    }
+    h1 { margin: 0; font-size: 1.25rem; color: #f0b34a; }
     .controls { display: flex; gap: 0.5rem; padding: 0 1rem; margin-bottom: 0.5rem; }
+    .iconBtn {
+      background: #151922;
+      color: #f0b34a;
+      border: 1px solid #222733;
+      padding: 0.5rem 0.7rem;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .iconBtn:hover { background: #1a1f2a; }
+    #authBox {
+      margin: 0.5rem 1rem 0.75rem;
+      padding: 0.75rem;
+      background: #11141a;
+      border: 1px solid #222733;
+      border-radius: 8px;
+      display: none;
+    }
+    #dndPwdInput {
+      width: 100%;
+      margin-top: 0.35rem;
+      padding: 0.75rem 0.9rem;
+      border: 1px solid #222733;
+      border-radius: 8px;
+      background: #151922;
+      color: #f7f7f7;
+      font-size: 1rem;
+    }
+    #dndPwdInput:focus { outline: none; border-color: #f0b34a; }
     button {
       padding: 0.75rem 1.25rem;
       background: #f0b34a;
@@ -1662,11 +1781,23 @@ def get_dnd_html() -> str:
   </style>
 </head>
 <body>
-  <h1>D&D Improv</h1>
+  <div class="topRow">
+    <h1>D&D Improv</h1>
+    <button type="button" id="unlockBtn" class="iconBtn" title="Unlock D&D">&#128274;</button>
+  </div>
+  <div id="authBox">
+    <label for="dndPwdInput">Enter D&D password</label>
+    <input type="password" id="dndPwdInput" placeholder="Password" />
+    <div class="controls" style="padding: 0; margin-top: 0.5rem;">
+      <button type="button" id="authSubmitBtn">Unlock</button>
+      <button type="button" id="authCancelBtn" class="stop">Cancel</button>
+    </div>
+    <div id="authMsg" class="error" style="min-height: 1.2rem;"></div>
+  </div>
   <div class="controls">
     <button type="button" id="recordBtn">Record</button>
     <button type="button" id="stopBtn" disabled class="stop">Stop</button>
-    <button type="button" id="sendBtn">Get suggestion</button>
+    <button type="button" id="sendBtn" disabled>Get suggestion</button>
   </div>
   <label for="transcript">Transcript (editable)</label>
   <textarea id="transcript" placeholder="Record or paste the recent table conversation..."></textarea>
@@ -1677,7 +1808,7 @@ def get_dnd_html() -> str:
     <button type="button" id="stopQBtn" disabled class="stop">Stop</button>
   </div>
   <div class="controls" style="margin-top: 0.25rem;">
-    <button type="button" id="askBtn">Ask (use campaign notes)</button>
+    <button type="button" id="askBtn" disabled>Ask (use campaign notes)</button>
   </div>
   <label>Read this aloud</label>
   <div id="reply" class="empty">Suggestions will appear here after you send the transcript.</div>
@@ -1688,9 +1819,78 @@ def get_dnd_html() -> str:
     const recordQBtn = document.getElementById('recordQBtn');
     const stopQBtn = document.getElementById('stopQBtn');
     const askBtn = document.getElementById('askBtn');
+    const unlockBtn = document.getElementById('unlockBtn');
+    const authBox = document.getElementById('authBox');
+    const dndPwdInput = document.getElementById('dndPwdInput');
+    const authSubmitBtn = document.getElementById('authSubmitBtn');
+    const authCancelBtn = document.getElementById('authCancelBtn');
+    const authMsgEl = document.getElementById('authMsg');
     const transcript = document.getElementById('transcript');
     const questionEl = document.getElementById('question');
     const replyEl = document.getElementById('reply');
+
+    let isAuthed = false;
+
+    function setAuthed(ok) {
+      isAuthed = !!ok;
+      sendBtn.disabled = !isAuthed;
+      askBtn.disabled = !isAuthed;
+      if (isAuthed) {
+        authBox.style.display = 'none';
+        unlockBtn.style.display = 'none';
+        authMsgEl.textContent = '';
+      } else {
+        unlockBtn.style.display = 'inline-block';
+      }
+    }
+
+    async function refreshAuth() {
+      try {
+        const r = await fetch('/dnd/auth/status', { credentials: 'same-origin' });
+        const data = await r.json().catch(() => ({}));
+        setAuthed(!!data.authed);
+      } catch (e) {
+        setAuthed(false);
+      }
+    }
+
+    unlockBtn.addEventListener('click', () => {
+      authMsgEl.textContent = '';
+      authBox.style.display = 'block';
+      setTimeout(() => { dndPwdInput.focus(); }, 0);
+    });
+
+    authCancelBtn.addEventListener('click', () => {
+      authBox.style.display = 'none';
+      authMsgEl.textContent = '';
+    });
+
+    authSubmitBtn.addEventListener('click', async () => {
+      const pwd = (dndPwdInput.value || '').toString();
+      authMsgEl.textContent = '';
+      try {
+        const r = await fetch('/dnd/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ password: pwd }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          authMsgEl.textContent = data.detail || 'Incorrect password';
+          setAuthed(false);
+          return;
+        }
+        dndPwdInput.value = '';
+        setAuthed(true);
+        authBox.style.display = 'none';
+      } catch (e) {
+        authMsgEl.textContent = 'Unlock failed.';
+        setAuthed(false);
+      }
+    });
+
+    refreshAuth();
 
     // Whisper STT: browser records audio, server transcribes, then we fill the editable textarea.
     let mediaRecorder = null;
@@ -1851,6 +2051,12 @@ def get_dnd_html() -> str:
     }
 
     sendBtn.addEventListener('click', async () => {
+      if (!isAuthed) {
+        authMsgEl.textContent = '';
+        authBox.style.display = 'block';
+        setTimeout(() => { dndPwdInput.focus(); }, 0);
+        return;
+      }
       const text = transcript.value.trim();
       if (!text) return;
       sendBtn.disabled = true;
@@ -1860,6 +2066,7 @@ def get_dnd_html() -> str:
         const r = await fetch('/dnd-improv', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
           body: JSON.stringify({ transcript: text })
         });
         const data = await r.json().catch(() => ({}));
@@ -1879,6 +2086,12 @@ def get_dnd_html() -> str:
     });
 
     askBtn.addEventListener('click', async () => {
+      if (!isAuthed) {
+        authMsgEl.textContent = '';
+        authBox.style.display = 'block';
+        setTimeout(() => { dndPwdInput.focus(); }, 0);
+        return;
+      }
       const q = (questionEl.value || '').trim();
       const tr = (transcript.value || '').trim();
       if (!q) return;
@@ -1889,6 +2102,7 @@ def get_dnd_html() -> str:
         const r = await fetch('/dnd/ask', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
           body: JSON.stringify({ question: q, transcript: tr || null })
         });
         const data = await r.json().catch(() => ({}));

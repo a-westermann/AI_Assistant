@@ -8,6 +8,7 @@ import base64
 import os
 from pathlib import Path
 from typing import NamedTuple
+import requests
 
 # Optional: "map_descriptions.txt" in campaign folder, format "filename.png: keyword1 keyword2"
 MAP_DESCRIPTIONS_FILENAME = "map_descriptions.txt"
@@ -24,6 +25,12 @@ CATALOG_PREVIEW_CHARS = 180
 # Module-level cache for RAG index (path -> (chunks_with_sources, embeddings))
 _rag_cache: dict = {}
 _embedding_model = None
+
+# LM Studio embeddings (fixed for now).
+# NOTE: This uses your already-downloaded model: `text-embedding-bge-small-en-v1.5`.
+LMSTUDIO_EMBEDDINGS_MODEL = "text-embedding-bge-small-en-v1.5"
+# LM Studio expects OpenAI-compatible embeddings at this route.
+LMSTUDIO_EMBEDDINGS_URL = "http://localhost:1234/v1/embeddings"
 
 # Default campaign folder; override with env DND_CONTEXT_DIR
 DND_CONTEXT_DIR = os.environ.get(
@@ -145,6 +152,72 @@ def _get_embedding_model():
     return _embedding_model
 
 
+def _extract_embeddings_from_lmstudio_response(resp_json: dict, expected_count: int) -> list[list[float]]:
+    """
+    Best-effort extraction for OpenAI-compatible embedding responses.
+    Supports a few common response shapes.
+    """
+    # OpenAI-ish: {"data":[{"embedding":[...],"index":0}, ...]}
+    data = resp_json.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        embeddings: list[list[float]] = []
+        for item in data:
+            emb = item.get("embedding")
+            if isinstance(emb, list):
+                embeddings.append([float(x) for x in emb])
+        if len(embeddings) == expected_count:
+            return embeddings
+
+    # Some servers: {"embeddings":[[...],[...]]}
+    embs = resp_json.get("embeddings")
+    if isinstance(embs, list) and embs and isinstance(embs[0], list):
+        embeddings = [[float(x) for x in emb] for emb in embs]
+        if len(embeddings) == expected_count:
+            return embeddings
+
+    # Fallback: sometimes wrapped under "output"
+    out = resp_json.get("output")
+    if isinstance(out, list) and out and isinstance(out[0], dict):
+        # Potential shapes:
+        # - output[0].embedding as a list of floats (single input)
+        # - output[i].embedding for each input
+        embeddings: list[list[float]] = []
+        for item in out:
+            emb = item.get("embedding")
+            if isinstance(emb, list):
+                embeddings.append([float(x) for x in emb])
+        if len(embeddings) == expected_count:
+            return embeddings
+
+    raise ValueError(f"LM Studio embeddings response shape not recognized (expected {expected_count} embeddings).")
+
+
+def _lmstudio_embed_batch(texts: list[str]) -> list[list[float]]:
+    """
+    Compute embeddings using LM Studio's embeddings endpoint.
+    Returns list of embedding vectors aligned with input `texts`.
+    """
+    if not texts:
+        return []
+
+    payload = {
+        "model": LMSTUDIO_EMBEDDINGS_MODEL,
+        "input": texts,
+        "store": False,
+    }
+    r = requests.post(LMSTUDIO_EMBEDDINGS_URL, json=payload, timeout=120)
+    r.raise_for_status()
+    resp_json = r.json() if r.text else {}
+    return _extract_embeddings_from_lmstudio_response(resp_json, expected_count=len(texts))
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    """
+    Compute embeddings using LM Studio only (no fallback).
+    """
+    return _lmstudio_embed_batch(texts)
+
+
 def _load_all_note_chunks(root: Path) -> list[tuple[str, str]]:
     """Load all text files and return list of (chunk, source_name)."""
     out: list[tuple[str, str]] = []
@@ -170,16 +243,24 @@ def _load_all_note_chunks(root: Path) -> list[tuple[str, str]]:
 def _build_rag_index(root: Path):
     """Build or return cached embedding index for the campaign folder."""
     root_str = str(root.resolve())
-    if root_str in _rag_cache:
-        return _rag_cache[root_str]
+    cache_key = f"{root_str}|lmstudio|model={LMSTUDIO_EMBEDDINGS_MODEL}|url={LMSTUDIO_EMBEDDINGS_URL}"
+    if cache_key in _rag_cache:
+        return _rag_cache[cache_key]
     chunks_with_sources = _load_all_note_chunks(root)
     if not chunks_with_sources:
-        _rag_cache[root_str] = ([], [])
+        _rag_cache[cache_key] = ([], [])
         return ([], [])
-    model = _get_embedding_model()
     chunks_only = [c for c, _ in chunks_with_sources]
-    embeddings = model.encode(chunks_only).tolist()
-    _rag_cache[root_str] = (chunks_with_sources, embeddings)
+
+    # Batch embedding requests to reduce LM Studio overhead and avoid giant payloads.
+    # (Works for both LM Studio and local models.)
+    batch_size = 32
+    embeddings: list[list[float]] = []
+    for start in range(0, len(chunks_only), batch_size):
+        batch = chunks_only[start : start + batch_size]
+        embeddings.extend(_embed_texts(batch))
+
+    _rag_cache[cache_key] = (chunks_with_sources, embeddings)
     return (chunks_with_sources, embeddings)
 
 
@@ -335,8 +416,9 @@ def get_rag_context(
         notes_text = "No notes loaded (no text files in campaign folder)."
         image_paths = []
     else:
-        model = _get_embedding_model()
-        query_embedding = model.encode(transcript or "conversation").tolist()
+        query_embedding = _embed_texts([transcript or "conversation"])[0]
+        # Keep existing cosine similarity behavior (normalize inside helper).
+        query_embedding = list(query_embedding)
         sims = _cosine_similarity(query_embedding, embeddings)
         top_indices = sorted(range(len(sims)), key=lambda i: -sims[i])[:top_k_text]
         parts = []

@@ -105,6 +105,7 @@ def _format_time_local(dt: datetime) -> str:
 def get_day_weather_forecast_summary(
     day_offset: int = 0,
     rain_probability_threshold: float = 50.0,
+    target_hour_24: int | None = None,
 ) -> str:
     """
     Fetch a concise day forecast using Open-Meteo (no API key).
@@ -136,7 +137,7 @@ def get_day_weather_forecast_summary(
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
-        "&hourly=temperature_2m,precipitation_probability,windspeed_10m"
+        "&hourly=temperature_2m,precipitation_probability,windspeed_10m,weathercode"
         f"&forecast_days={max(1, day_offset + 1)}"
         "&timezone=auto"
     )
@@ -159,9 +160,10 @@ def get_day_weather_forecast_summary(
     temps_c: List[Any] = hourly.get("temperature_2m") or []
     pp: List[Any] = hourly.get("precipitation_probability") or []
     wind_kmh: List[Any] = hourly.get("windspeed_10m") or []
+    weather_codes: List[Any] = hourly.get("weathercode") or []
 
-    if not (times and temps_c and pp and wind_kmh) or not (
-        len(times) == len(temps_c) == len(pp) == len(wind_kmh)
+    if not (times and temps_c and pp and wind_kmh and weather_codes) or not (
+        len(times) == len(temps_c) == len(pp) == len(wind_kmh) == len(weather_codes)
     ):
         raise WeatherClientError("Weather forecast missing hourly fields.")
 
@@ -178,6 +180,33 @@ def get_day_weather_forecast_summary(
 
     if not day_indices:
         raise WeatherClientError(f"Weather forecast had no hourly points for {day_label.lower()}.")
+
+    # If user asked for a specific time ("at noon", "1pm"), answer from the nearest hour point.
+    if target_hour_24 is not None:
+        target_hour_24 = max(0, min(23, int(target_hour_24)))
+        # Prefer same/next hour if exact hour is missing; otherwise nearest.
+        best_time_i = min(
+            day_indices,
+            key=lambda i: abs(_parse_time_iso(times[i]).hour - target_hour_24),
+        )
+        point_dt = _parse_time_iso(times[best_time_i])
+        point_label = _format_time_local(point_dt)
+        temp_c = temps_c[best_time_i]
+        temp_f = temp_c * 9.0 / 5.0 + 32.0 if isinstance(temp_c, (int, float)) else None
+        precip = pp[best_time_i] if isinstance(pp[best_time_i], (int, float)) else None
+        wind = wind_kmh[best_time_i] if isinstance(wind_kmh[best_time_i], (int, float)) else None
+        code = weather_codes[best_time_i] if isinstance(weather_codes[best_time_i], (int, float)) else None
+        condition = _weather_code_description(int(code)).lower() if code is not None else "mixed conditions"
+
+        parts: list[str] = [f"Around {point_label} on {day_label}, expect {condition}"]
+        if temp_f is not None:
+            parts[0] += f" near {temp_f:.0f} degrees"
+        parts[0] += "."
+        if precip is not None:
+            parts.append(f"Precipitation chance is about {precip:.0f}%.")
+        if wind is not None:
+            parts.append(f"Wind should be around {wind:.0f} km/h.")
+        return " ".join(parts)
 
     # Temperature high and time of peak (max temp).
     best_i = max(

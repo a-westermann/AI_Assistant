@@ -1,31 +1,112 @@
 {
   "items": [
     {
-      "id": "66fe09f5-85f3-489a-9309-4f13ca61e831",
+      "id": "6c073cce-4e29-47d0-aabe-282bf9ab19aa",
       "name": "strawberries",
       "normalized_name": "strawberries",
       "quantity": 1,
-      "checked": false,
-      "created_at": "2026-03-25T21:14:34.477459+00:00",
-      "updated_at": "2026-03-25T21:14:34.477459+00:00"
+      "checked": true,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
     },
     {
       "id": "83cb5f04-b3d8-4f2c-8e93-d1b773f5f858",
       "name": "raspberries",
       "normalized_name": "raspberries",
       "quantity": 1,
+      "checked": true,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "90fcd880-1580-4b04-8521-cf8b6a4fed47",
+      "name": "cilantro",
+      "normalized_name": "cilantro",
+      "quantity": 1,
       "checked": false,
-      "created_at": "2026-03-23T23:25:07.433437+00:00",
-      "updated_at": "2026-03-23T23:25:07.433437+00:00"
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "e9c1a9e7-dec2-4a5b-a58b-de29d160a105",
+      "name": "cornstarch",
+      "normalized_name": "cornstarch",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "eeac6b80-fa8b-46f0-aeec-3b4a158e0d6f",
+      "name": "red bell pepper",
+      "normalized_name": "red bell pepper",
+      "quantity": 1,
+      "checked": true,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "25521e5e-4f9c-41b7-9747-1d2d37711409",
+      "name": "1 egg roll wrapper",
+      "normalized_name": "1 egg roll wrapper",
+      "quantity": 1,
+      "checked": true,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "43033e46-1d68-4d68-920a-39b067a351b8",
+      "name": "green bell pepper",
+      "normalized_name": "green bell pepper",
+      "quantity": 1,
+      "checked": true,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "54e8d945-e508-4ae5-9bb1-ba4bb533e1ca",
+      "name": "olive bar",
+      "normalized_name": "olive bar",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
     },
     {
       "id": "8cec2df8-c900-447e-98d9-ce5351ceea1d",
       "name": "lettuce",
       "normalized_name": "lettuce",
       "quantity": 1,
+      "checked": true,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "9d144d1d-be4f-4aeb-9125-2518cffa8801",
+      "name": "red potatoes",
+      "normalized_name": "red potatoes",
+      "quantity": 1,
       "checked": false,
-      "created_at": "2026-03-25T21:17:47.224333+00:00",
-      "updated_at": "2026-03-25T21:17:47.224333+00:00"
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "9cf20348-6aa9-4456-b9e3-9780636fd9ca",
+      "name": "yellow onion",
+      "normalized_name": "yellow onion",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "eac12c90-971d-4ea9-a442-fc963c0e2d28",
+      "name": "red onion",
+      "normalized_name": "red onion",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
     },
     {
       "id": "01340d90-efe6-4fb8-9075-0600aadb7b20",
@@ -33,8 +114,8 @@
       "normalized_name": "bread",
       "quantity": 1,
       "checked": false,
-      "created_at": "2026-03-25T21:15:19.770536+00:00",
-      "updated_at": "2026-03-25T21:15:19.770536+00:00"
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
     },
     {
       "id": "a70b6433-f73f-4e26-b230-712d2295874e",
@@ -42,8 +123,26 @@
       "normalized_name": "hotdog buns",
       "quantity": 1,
       "checked": false,
-      "created_at": "2026-03-25T21:15:05.829537+00:00",
-      "updated_at": "2026-03-25T21:15:05.829537+00:00"
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "d6c0f140-5fe5-4b45-b8f8-74a3dba1c505",
+      "name": "bagels",
+      "normalized_name": "bagels",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "79dadb5c-c41d-48ee-b921-54b4ca06a58f",
+      "name": "low cal tortillas",
+      "normalized_name": "low cal tortillas",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
     },
     {
       "id": "a733ab07-08ce-4ad2-b1cd-e751d0855049",
@@ -51,8 +150,26 @@
       "normalized_name": "bbq sauce",
       "quantity": 1,
       "checked": false,
-      "created_at": "2026-03-25T21:16:15.153972+00:00",
-      "updated_at": "2026-03-25T21:16:15.153972+00:00"
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "3e2326c8-e49f-47da-9ee7-8e8cf845e7a7",
+      "name": "sauerkraut",
+      "normalized_name": "sauerkraut",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "905f77bc-d0ab-4718-bbbd-a2e77a96ca19",
+      "name": "olives (canned)",
+      "normalized_name": "olives (canned)",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
     },
     {
       "id": "2749e023-5ae6-4aef-b41a-6138680ab61e",
@@ -60,8 +177,44 @@
       "normalized_name": "brats",
       "quantity": 1,
       "checked": false,
-      "created_at": "2026-03-25T21:14:44.999702+00:00",
-      "updated_at": "2026-03-25T21:18:26.638637+00:00"
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "34915bb9-3968-4f1c-8a35-0cd16c424fd7",
+      "name": "chicken lunchmeat",
+      "normalized_name": "chicken lunchmeat",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "50515159-16be-42ff-9973-d0f33ad968f4",
+      "name": "1lb ribeye steak",
+      "normalized_name": "1lb ribeye steak",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "7b242a52-d495-4f56-b010-719f4e622867",
+      "name": "spicy chicken strips",
+      "normalized_name": "spicy chicken strips",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "ff3e31c5-2bac-4233-99a4-805ad45b2929",
+      "name": "frozen chicken nuggets",
+      "normalized_name": "frozen chicken nuggets",
+      "quantity": 2,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
     },
     {
       "id": "dd140bc9-8a9a-40de-896a-7b6ef9f79616",
@@ -69,8 +222,89 @@
       "normalized_name": "charcoal",
       "quantity": 1,
       "checked": false,
-      "created_at": "2026-03-25T21:18:49.351685+00:00",
-      "updated_at": "2026-03-25T21:18:49.351685+00:00"
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "17c239cf-0e93-4a75-98d8-710963dd0053",
+      "name": "mexican shredded cheese (4 cheese kind)",
+      "normalized_name": "mexican shredded cheese (4 cheese kind)",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "4c878414-f993-43db-a249-cc528e699c77",
+      "name": "provolone cheese",
+      "normalized_name": "provolone cheese",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "2e8cf27f-dfe1-4677-9344-afcabe0eb75a",
+      "name": "swiss cheese",
+      "normalized_name": "swiss cheese",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "6ff31286-9975-4320-b8ae-6e4d79340ea8",
+      "name": "american cheese",
+      "normalized_name": "american cheese",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "ef9cf29f-e53b-497d-8ed8-f5fd3f746a6c",
+      "name": "cream cheese",
+      "normalized_name": "cream cheese",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "680b3a4b-fe32-48a0-bfcf-a4d5f8b0b0b4",
+      "name": "butter",
+      "normalized_name": "butter",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "5fe2c3f7-243a-4c1a-866c-f97d7264acf5",
+      "name": "frozen corn",
+      "normalized_name": "frozen corn",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "a3cc17c1-174c-4c5f-b6dc-c904fb0ade5e",
+      "name": "toasted rav",
+      "normalized_name": "toasted rav",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
+    },
+    {
+      "id": "9047908d-0e02-4344-94ec-163aad9c8873",
+      "name": "meat sauce",
+      "normalized_name": "meat sauce",
+      "quantity": 1,
+      "checked": false,
+      "created_at": "2026-03-26T21:34:09.578013+00:00",
+      "updated_at": "2026-03-26T21:34:09.578013+00:00"
     }
   ]
 }

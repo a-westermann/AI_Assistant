@@ -12,6 +12,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+import os
 from typing import Any
 
 from llm import ask_lmstudio
@@ -36,6 +37,22 @@ _RE_PLAY_SPOTIFY = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Generic play <query> (treated as Spotify unless user explicitly mentions YouTube).
+_RE_PLAY_GENERIC = re.compile(
+    r"^\s*(?:please\s+)?play\s+(.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Pause / stop playback trigger phrases
+_RE_PAUSE = re.compile(
+    r"^\s*(?:please\s+)?(?:pause|stop)\s+(?:the\s+)?(?:spotify\s+)?playback\s*$",
+    re.IGNORECASE,
+)
+_RE_SPOTIFY_PAUSE = re.compile(
+    r"^\s*spotify\s*[:\s]+(?:pause|stop)\s*$",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class SpotifyResolution:
@@ -58,14 +75,35 @@ def looks_like_spotify_play_request(text: str) -> bool:
     return extract_spotify_play_intent(text) is not None
 
 
+def looks_like_spotify_pause_request(text: str) -> bool:
+    if not text or not str(text).strip():
+        return False
+    t = str(text).strip()
+    return bool(_RE_PAUSE.match(t) or _RE_SPOTIFY_PAUSE.match(t))
+
+
 def extract_spotify_play_intent(text: str) -> str | None:
     """Return the search phrase (without 'on Spotify' wrappers)."""
     t = (text or "").strip()
+
+    # If the user explicitly mentions YouTube, don't treat it as a Spotify request.
+    # (This keeps the old YouTube "Play ..." flow intact.)
+    t_lower = t.lower()
+    if "youtube" in t_lower or "yt" in t_lower:
+        return None
+
     for rx in (_RE_PLAY_ON_SPOTIFY, _RE_SPOTIFY_PREFIX, _RE_PLAY_SPOTIFY):
         m = rx.match(t)
         if m:
             inner = (m.group(1) or "").strip()
             return inner or None
+
+    # If it's just "play <query>", default to Spotify query.
+    m = _RE_PLAY_GENERIC.match(t)
+    if m:
+        inner = (m.group(1) or "").strip()
+        return inner or None
+
     return None
 
 
@@ -124,6 +162,16 @@ def _infer_search_kind(intent_lower: str) -> str:
     if re.search(r"\balbum\b", intent_lower):
         return "album"
     return "track"
+
+
+def _norm_device_name(s: str | None) -> str:
+    """Normalize device names so matching works across spaces/underscores/hyphens."""
+    if not s:
+        return ""
+    x = s.lower().strip()
+    # Remove non-alphanumerics (includes spaces, underscores, hyphens, etc.)
+    x = re.sub(r"[^a-z0-9]+", "", x)
+    return x
 
 
 def resolve_spotify_play(
@@ -219,6 +267,25 @@ def resolve_spotify_play(
             error="No results on Spotify for that query.",
         )
 
+    # If the caller didn't specify device_id, try matching a stable device name
+    # (e.g. librespot --name "Galadrial_Pi"). This makes assistant playback land
+    # on the Pi even if Spotify's "active device" changes.
+    if dev is None:
+        desired_name = (os.environ.get("SPOTIFY_DEVICE_NAME") or "Galadrial_Pi").strip()
+        desired_norm = _norm_device_name(desired_name)
+        try:
+            devices = sc.list_connect_devices(sp)
+            logger.info("spotify_resolver: matching device by name. desired=%r norm=%r devices=%s", desired_name, desired_norm, [d.get("name") for d in devices])
+            for d in devices:
+                nm = (d.get("name") or "").strip()
+                nm_norm = _norm_device_name(nm)
+                if nm_norm and desired_norm and (desired_norm in nm_norm or nm_norm in desired_norm):
+                    dev = d.get("id") or None
+                    logger.info("spotify_resolver: matched device %r (id=%r)", nm, dev)
+                    break
+        except Exception:
+            dev = None
+
     res = SpotifyResolution(
         ok=True,
         uri=uri,
@@ -247,6 +314,41 @@ def resolve_spotify_play(
             )
 
     return res
+
+
+def pause_spotify_playback(device_id: str | None = None) -> tuple[bool, str, str | None]:
+    """
+    Pause Spotify playback. Returns (ok, detail, used_device_id).
+    """
+    if not sc.spotify_credentials_configured():
+        return False, "Spotify is not configured.", None
+    try:
+        sp = sc.get_spotify()
+    except Exception as e:
+        return False, str(e), None
+
+    dev = device_id if device_id is not None else sc.default_device_id()
+    if dev is None:
+        desired_name = (os.environ.get("SPOTIFY_DEVICE_NAME") or "Galadrial_Pi").strip()
+        desired_norm = _norm_device_name(desired_name)
+        try:
+            devices = sc.list_connect_devices(sp)
+            for d in devices:
+                nm_norm = _norm_device_name(str(d.get("name") or ""))
+                if nm_norm and desired_norm and (desired_norm in nm_norm or nm_norm in desired_norm):
+                    dev = d.get("id") or None
+                    break
+        except Exception:
+            dev = None
+
+    try:
+        if dev:
+            sp.pause_playback(device_id=dev)
+        else:
+            sp.pause_playback()
+        return True, "", dev
+    except Exception as e:
+        return False, str(e), dev
 
 
 def format_spotify_resolution_reply(res: SpotifyResolution) -> str:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -201,6 +202,14 @@ def start_playback(
     """
     kwargs: dict[str, Any] = {}
     if device_id:
+        # Force the target Connect device active first. Without this, Spotify may keep
+        # playback on the last active client unless the user pre-selects the Pi manually.
+        try:
+            sp.transfer_playback(device_id=device_id, force_play=False)
+            # Give Spotify a brief moment to apply the transfer before start_playback.
+            time.sleep(0.25)
+        except Exception as e:
+            logger.warning("spotify_client: transfer_playback failed for device %r: %s", device_id, e)
         kwargs["device_id"] = device_id
     if kind == "track":
         sp.start_playback(uris=[uri], **kwargs)
