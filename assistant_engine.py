@@ -44,17 +44,14 @@ from lighting.assistant_engine_lighting import (
     try_handle_lighting_action,
 )
 from lighting.auto_lighting_sync import start_auto_lighting_sync, stop_auto_lighting_sync
-from music.play_resolver import (
-    format_play_resolution_reply,
-    looks_like_play_music_request,
-    resolve_play_to_video_id,
-)
 from music.spotify_resolver import (
     format_spotify_resolution_reply,
     looks_like_spotify_pause_request,
     looks_like_spotify_play_request,
+    looks_like_spotify_skip_request,
     pause_spotify_playback,
     resolve_spotify_play,
+    skip_spotify_track,
 )
 
 
@@ -122,6 +119,8 @@ class AssistantEngine:
                 "brightness",
                 "dim",
                 "bright",
+                "darker",
+                "lighter",
                 "cozy",
                 "warm",
                 # Phrases like "create an animation with rainbow colors" often omit "lights".
@@ -414,6 +413,81 @@ class AssistantEngine:
             return False
         return True
 
+    def _is_relative_brightness_adjust_request(self, text: str) -> int:
+        """
+        Detect quick "brighter/darker" intents.
+        Returns +1 for brighter, -1 for darker/dimmer, 0 for no match.
+        """
+        t = (text or "").lower().strip()
+        if not t:
+            return 0
+
+        brighter_hits = (
+            "brighter",
+            "brighten",
+            "more bright",
+            "increase brightness",
+            "turn up the brightness",
+            "raise brightness",
+            "lighter",
+        )
+        darker_hits = (
+            "darker",
+            "darken",
+            "dimmer",
+            "dimmer",
+            "lower brightness",
+            "decrease brightness",
+            "turn down the brightness",
+        )
+
+        wants_brighter = any(p in t for p in brighter_hits)
+        wants_darker = any(p in t for p in darker_hits)
+        if wants_brighter and not wants_darker:
+            return 1
+        if wants_darker and not wants_brighter:
+            return -1
+        return 0
+
+    def _apply_relative_brightness_adjust(self, direction: int, user_text: str) -> str:
+        """
+        Apply a +/- brightness step while preserving current color/theme.
+        direction: +1 brighter, -1 darker.
+        """
+        stop_auto_lighting_sync(log_fn=self.log)
+        cur = None
+        try:
+            state = get_lights_state()
+            b = state.get("brightness")
+            if isinstance(b, int):
+                cur = b
+        except LightsClientError as e:
+            self.log(f"Govee brightness read failed before relative adjust: {e}")
+
+        if cur is None:
+            cur = 60
+        step = 20
+        target = min(100, cur + step) if direction > 0 else max(5, cur - step)
+
+        try:
+            # Keep current color/temperature by only setting brightness.
+            set_lights_style(state="on", brightness=target, color_hex=None, color_temp_k=None)
+        except LightsClientError as e:
+            self.log(f"Govee relative brightness adjust failed: {e}")
+        try:
+            nanoleaf.turn_on()
+            nanoleaf.set_brightness(target)
+        except Exception as e:
+            self.log(f"Nanoleaf relative brightness adjust failed: {e}")
+
+        dir_word = "increased" if direction > 0 else "decreased"
+        return self._call_model(
+            user_text,
+            None,
+            extra_note=f"System note: The app {dir_word} light brightness to about {target}% while preserving the current color/theme.\n\n",
+            compact_system=True,
+        )
+
     def _is_too_dark_to_get_bright(self, text: str) -> bool:
         """
         Detect requests that mean "turn the lights brighter" / "it's dark in here".
@@ -571,7 +645,7 @@ Schema:
       "colors_hex": ["#RRGGBB", ...] | null,# for animation (2-6 colors)
       "scene_name": "Scene Name" | null,    # for scene (must be from list)
       "brightness": 0-100 | null,           # for static_color/brightness
-      "speed": 0.5-5 | null,                # for animation
+      "speed": 0.1-5 | null,                # for animation (lower=faster, higher=slower)
       "animation": true | false | null      # if user specifies no animation
     }}
   ]
@@ -663,7 +737,7 @@ Reply with JSON only (no markdown)."""
                 sp = a.get("speed")
                 try:
                     out["speed"] = (
-                        max(0.5, min(5.0, float(sp)))
+                        max(0.1, min(5.0, float(sp)))
                         if sp is not None
                         else infer_flow_speed(user_text)
                     )
@@ -810,7 +884,7 @@ Reply with JSON only (no markdown)."""
         """
         Re-apply the last custom flow with a new speed when the user asks faster/slower.
         Uses last_route in-process or persisted state (each HTTP request uses a new engine).
-        Nanoleaf speed param: higher value = faster motion (see create_flow_effect).
+        Nanoleaf speed param here is transition-style: lower = faster, higher = slower.
         """
         prev_params: dict | None = None
         if self.last_route and self.last_route.get("action") == "nanoleaf.create_animation":
@@ -825,6 +899,27 @@ Reply with JSON only (no markdown)."""
                     "colors": list(stored["colors"]),
                     "speed": float(stored.get("speed", 1.0)),
                 }
+        if prev_params is None:
+            # Fallback for non-custom animations (e.g. scene selected from scenes.txt):
+            # read current selected effect and derive a stable palette so speed changes
+            # can still be applied instead of failing with "no saved custom animation".
+            try:
+                current_effect = nanoleaf.get_selected_effect()
+            except Exception:
+                current_effect = None
+            if isinstance(current_effect, str) and current_effect.strip():
+                derived = infer_flow_colors_hex(current_effect.strip())
+                if isinstance(derived, list) and len(derived) >= 2:
+                    prev_params = {
+                        "colors": derived[:6],
+                        "speed": 1.0,
+                    }
+                    # Persist so subsequent faster/slower calls in this context are stable.
+                    persist_last_nanoleaf_flow(
+                        getattr(self, "_active_user_name", None),
+                        prev_params["colors"],
+                        float(prev_params["speed"]),
+                    )
         if not prev_params:
             return None
         colors = prev_params.get("colors")
@@ -835,33 +930,61 @@ Reply with JSON only (no markdown)."""
             current = float(prev_params.get("speed", 1.0))
         except (TypeError, ValueError):
             current = 1.0
-        current = max(0.5, min(5.0, current))
-        if any(
+        current = max(0.1, min(5.0, current))
+        has_anim_word = any(w in t for w in ("pulse", "flow", "animation", "animate", "cycle"))
+        wants_faster = any(
             phrase in t
             for phrase in (
                 "super fast",
                 "really fast",
                 "maximum speed",
                 "max speed",
+                "as fast as possible",
+                "fast as possible",
                 "faster",
                 "speed it up",
                 "speed up",
                 "a little faster",
                 "make it faster",
-                "flow faster",
-                "pulse faster",
-                "animate faster",
-                "cycle faster",
                 "quicker",
                 "more quickly",
             )
-        ):
-            if "super fast" in t or "really fast" in t or "maximum speed" in t or "max speed" in t:
-                new_speed = 5.0
+        ) or (has_anim_word and any(w in t for w in ("faster", "speed", "quick")))
+        wants_slower = any(
+            phrase in t
+            for phrase in (
+                "slower",
+                "as slow as possible",
+                "slow as possible",
+                "minimum speed",
+                "min speed",
+                "slow it down",
+                "slow down",
+                "a little slower",
+                "make it slower",
+                "more slowly",
+                "gentler",
+            )
+        ) or (has_anim_word and any(w in t for w in ("slower", "slow", "gentle")))
+
+        if wants_faster and not wants_slower:
+            if (
+                "super fast" in t
+                or "really fast" in t
+                or "maximum speed" in t
+                or "max speed" in t
+                or "as fast as possible" in t
+                or "fast as possible" in t
+            ):
+                new_speed = 0.1
             elif "a little" in t:
-                new_speed = min(5.0, round(current * 1.2, 1))
+                new_speed = max(0.1, round(current * 0.8, 2))
             else:
-                new_speed = min(5.0, round(current * 1.45, 1))
+                # Larger jump so "faster" is visually obvious on device.
+                if current > 1.0:
+                    new_speed = max(0.1, round(current * 0.55, 2))
+                else:
+                    new_speed = max(0.1, round(current - 0.25, 2))
             return {
                 "action": "nanoleaf.create_animation",
                 "params": {
@@ -870,23 +993,21 @@ Reply with JSON only (no markdown)."""
                     "speed": new_speed,
                 },
             }
-        if any(
-            phrase in t
-            for phrase in (
-                "slower",
-                "slow it down",
-                "slow down",
-                "a little slower",
-                "make it slower",
-                "more slowly",
-                "gentler",
-                "pulse slower",
-            )
-        ):
-            if "a little" in t:
-                new_speed = max(0.5, round(current * 0.85, 1))
+        if wants_slower and not wants_faster:
+            if (
+                "as slow as possible" in t
+                or "slow as possible" in t
+                or "minimum speed" in t
+                or "min speed" in t
+            ):
+                new_speed = 5.0
+            elif "a little" in t:
+                new_speed = min(5.0, round(current * 1.2, 2))
             else:
-                new_speed = max(0.5, round(current * 0.65, 1))
+                if current < 2.0:
+                    new_speed = min(5.0, round(current * 1.7, 2))
+                else:
+                    new_speed = min(5.0, round(current + 1.0, 2))
             return {
                 "action": "nanoleaf.create_animation",
                 "params": {
@@ -958,6 +1079,35 @@ Reply with JSON only (no markdown)."""
                 "speed": spd,
             },
         }
+
+    def _is_animation_speed_adjust_intent(self, text: str) -> bool:
+        """Detect requests like 'pulse faster/slower', 'speed up the animation'."""
+        t = (text or "").lower().strip()
+        if not t:
+            return False
+        has_anim_ref = any(w in t for w in ("pulse", "flow", "animation", "animate", "cycle"))
+        has_speed_ref = any(
+            w in t
+            for w in (
+                "faster",
+                "slower",
+                "as fast as possible",
+                "fast as possible",
+                "as slow as possible",
+                "slow as possible",
+                "speed up",
+                "slow down",
+                "max speed",
+                "min speed",
+                "maximum speed",
+                "minimum speed",
+                "quicker",
+                "more quickly",
+                "more slowly",
+                "gentler",
+            )
+        )
+        return has_anim_ref and has_speed_ref
 
     def route(self, user_text: str) -> dict:
         """Return {action, params} by asking the model to choose a tool from TOOLS based on the user's intent. No keyword routing."""
@@ -1062,7 +1212,7 @@ Respond with JSON only:
                 "- Safety: Do NOT invent facts about personal data. If you weren't given a tool/system"
                 " result for a requested detail (like weather), say you don't know.\n"
                 "- If you are given a system note saying the app set lights/weather, you may describe it.\n"
-                "- If the user asks about D&D improv, direct them to http://localhost:8000/dnd.\n\n"
+                "\n"
             )
         else:
             system_preamble = (
@@ -1226,24 +1376,16 @@ Respond with JSON only:
                 return "Paused Spotify playback."
             return f"I couldn't pause Spotify playback: {detail or 'unknown error'}."
 
-        # Spotify before generic "Play …" (YouTube).
-        # If Spotify playback can't start and the user did NOT explicitly mention Spotify,
-        # fall back to the existing YouTube pipeline.
-        explicit_spotify = "spotify" in (user_text or "").lower()
+        if looks_like_spotify_skip_request(user_text):
+            ok, detail, _dev = skip_spotify_track()
+            if ok:
+                return "Skipped to the next track."
+            return f"I couldn't skip the track: {detail or 'unknown error'}."
+
+        # Spotify is the only music playback path.
         if looks_like_spotify_play_request(user_text):
             sp_res = resolve_spotify_play(user_text)
-            if sp_res.ok and (sp_res.playback_started or explicit_spotify):
-                return format_spotify_resolution_reply(sp_res)
-            # Soft fallback only when the user didn't explicitly ask for Spotify.
-            if not explicit_spotify and looks_like_play_music_request(user_text):
-                res = resolve_play_to_video_id(user_text)
-                return format_play_resolution_reply(res)
             return format_spotify_resolution_reply(sp_res)
-
-        # YouTube "Play …" → search → video_id (pass to Pi / player separately).
-        if looks_like_play_music_request(user_text):
-            res = resolve_play_to_video_id(user_text)
-            return format_play_resolution_reply(res)
 
         if self._is_help_request(user_text):
             tool_lines = self._load_help_tools()
@@ -1360,6 +1502,12 @@ Respond with JSON only:
                 extra_note=f"System note: The app has just remembered that '{key}' means '{value}'. You can acknowledge that briefly.\n\n",
             )
 
+        # Deterministic relative brightness adjustment:
+        # "make them brighter", "make lights darker", etc.
+        brightness_dir = self._is_relative_brightness_adjust_request(effective_text)
+        if brightness_dir != 0:
+            return self._apply_relative_brightness_adjust(brightness_dir, user_text)
+
         # Deterministic: auto mode enables Govee auto and keeps Nanoleaf synced every minute.
         t_lower = (effective_text or "").lower()
         if (
@@ -1417,6 +1565,26 @@ Respond with JSON only:
                 extra_note=f"System note: The app increased brightness to {target_brightness}%. Preserve the current lighting color/theme; do not change scenes.\n\n",
                 compact_system=True,
             )
+
+        # Deterministic speed adjust for existing custom flow (must run BEFORE lighting-plan path,
+        # otherwise LLM planning may generate a fresh animation and change colors).
+        speed_route = self._route_speed_adjust(effective_text)
+        if speed_route is not None:
+            self.last_route = speed_route
+            self.last_user_message = effective_text
+            lighting_reply = try_handle_lighting_action(
+                self,
+                speed_route["action"],
+                speed_route["params"],
+                user_text,
+                effective_text,
+            )
+            if lighting_reply is not None:
+                return lighting_reply
+        elif self._is_animation_speed_adjust_intent(effective_text):
+            # User asked to speed up/slow down animation, but we don't have a stored flow state yet.
+            # Avoid creating a brand-new random palette as a fallback.
+            return "I don't have a saved custom animation to adjust yet. Ask me to create one first, then I can speed it up or slow it down without changing colors."
 
         # Deterministic flow animations: skip lighting-plan + router LLM when intent is unambiguous.
         flow_route = self._route_flow_animation(effective_text)

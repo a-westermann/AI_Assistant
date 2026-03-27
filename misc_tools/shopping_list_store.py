@@ -216,6 +216,56 @@ def delete_item(item_id: str) -> None:
     _save_items(_sorted_items(new_items))
 
 
+def merge_ingredients_into_shopping_list(ingredients: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    For each ingredient line, add quantity to an existing list row with the same normalized
+    name, or append a new row. Quantities are capped 1..999 per row.
+    """
+    items = list(_load_items_raw().get("items") or [])
+    now = _now_iso()
+    for raw in ingredients:
+        if not isinstance(raw, dict):
+            continue
+        display = str(raw.get("name") or "").strip().lower()
+        if not display:
+            continue
+        n = normalize_name(display)
+        try:
+            add_q = int(raw.get("quantity", 1))
+        except Exception:
+            add_q = 1
+        add_q = max(1, min(999, add_q))
+        idx = next(
+            (
+                i
+                for i, it in enumerate(items)
+                if isinstance(it, dict) and normalize_name(str(it.get("normalized_name") or it.get("name") or "")) == n
+            ),
+            -1,
+        )
+        if idx >= 0:
+            cur = dict(items[idx])
+            cur_q = int(cur.get("quantity", 1))
+            new_q = max(1, min(999, cur_q + add_q))
+            cur["quantity"] = new_q
+            cur["updated_at"] = now
+            items[idx] = cur
+        else:
+            items.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "name": display,
+                    "normalized_name": n,
+                    "quantity": add_q,
+                    "checked": False,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+    _save_items(_sorted_items(items))
+    return get_items()
+
+
 def replace_all(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     dedup: dict[str, dict[str, Any]] = {}
     out: list[dict[str, Any]] = []

@@ -63,12 +63,7 @@ from lighting.auto_lighting_sync import (
     stop_auto_lighting_sync,
     is_auto_lighting_sync_live,
 )
-from music.play_resolver import (
-    PlayResolution,
-    format_play_resolution_reply,
-    looks_like_play_music_request,
-    resolve_play_to_video_id,
-)
+from lighting.assistant_engine_lighting import clear_last_nanoleaf_flow
 from music.spotify_client import (
     SpotifyAuthRequiredError,
     SpotifyNotConfiguredError,
@@ -81,8 +76,17 @@ from music.spotify_resolver import (
     format_spotify_resolution_reply,
     looks_like_spotify_pause_request,
     looks_like_spotify_play_request,
+    looks_like_spotify_skip_request,
     pause_spotify_playback,
     resolve_spotify_play,
+    skip_spotify_track,
+)
+from misc_tools.recipes_store import (
+    apply_recipe_to_shopping_list as recipes_apply_to_shopping,
+    create_recipe as recipes_create,
+    delete_recipe as recipes_delete,
+    list_recipes as recipes_list,
+    update_recipe as recipes_update,
 )
 from misc_tools.shopping_list_store import (
     add_item as shopping_add_item,
@@ -264,9 +268,9 @@ def _pop_async_failure() -> str | None:
         return _async_failures.popleft()
 
 
-def _run_background_action(message: str) -> None:
+def _run_background_action(message: str, user_name: str) -> None:
     try:
-        reply = handle_message(message, log_fn=_log_event) or ""
+        reply = handle_message(message, log_fn=_log_event, user_name=user_name) or ""
         low = reply.lower()
         if any(x in low for x in ("failed", "error", "sorry")):
             _record_async_failure(reply)
@@ -351,17 +355,6 @@ class ChatRequest(BaseModel):
     user_name: str | None = None
 
 
-class MusicSearchPayload(BaseModel):
-    """YouTube search result for a \"Play …\" message (video id for a downstream player)."""
-
-    ok: bool
-    video_id: str | None = None
-    title: str | None = None
-    search_query: str | None = None
-    raw_intent: str | None = None
-    error: str | None = None
-
-
 class SpotifyPlayPayload(BaseModel):
     """Spotify URI + optional Connect playback result (librespot / Pi as a Connect device)."""
 
@@ -373,6 +366,7 @@ class SpotifyPlayPayload(BaseModel):
     search_query: str | None = None
     raw_intent: str | None = None
     playback_started: bool = False
+    queued_count: int = 0
     device_id: str | None = None
     error: str | None = None
     playback_error: str | None = None
@@ -380,7 +374,6 @@ class SpotifyPlayPayload(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
-    music: MusicSearchPayload | None = None
     spotify: SpotifyPlayPayload | None = None
     # Set on synchronous /chat when create_flow_effect ran this request (check ok / detail without seeing panels).
     nanoleaf_flow: dict | None = None
@@ -481,15 +474,19 @@ class ShoppingReplaceAllRequest(BaseModel):
     items: list[dict]
 
 
-class MusicPrepareRequest(BaseModel):
-    """Phrase like \"Play Polica\" (must match play intent — leading Play …)."""
+class RecipeIngredientIn(BaseModel):
+    name: str
+    quantity: int = 1
 
-    phrase: str
+
+class RecipeCreateRequest(BaseModel):
+    name: str
+    ingredients: list[RecipeIngredientIn]
 
 
-class MusicPrepareResponse(BaseModel):
-    reply: str
-    music: MusicSearchPayload
+class RecipeUpdateRequest(BaseModel):
+    name: str | None = None
+    ingredients: list[RecipeIngredientIn] | None = None
 
 
 class SpotifyPrepareRequest(BaseModel):
@@ -497,6 +494,7 @@ class SpotifyPrepareRequest(BaseModel):
 
     phrase: str
     device_id: str | None = None
+    queue_size: int = 10
     attempt_playback: bool = True
     skip_llm_refinement: bool = False
 
@@ -504,17 +502,6 @@ class SpotifyPrepareRequest(BaseModel):
 class SpotifyPrepareResponse(BaseModel):
     reply: str
     spotify: SpotifyPlayPayload
-
-
-def _music_search_payload(res: PlayResolution) -> MusicSearchPayload:
-    return MusicSearchPayload(
-        ok=res.ok,
-        video_id=res.video_id,
-        title=res.title,
-        search_query=res.search_query,
-        raw_intent=res.raw_intent,
-        error=res.error if not res.ok else None,
-    )
 
 
 def _spotify_play_payload(res: SpotifyResolution) -> SpotifyPlayPayload:
@@ -527,6 +514,7 @@ def _spotify_play_payload(res: SpotifyResolution) -> SpotifyPlayPayload:
         search_query=res.search_query,
         raw_intent=res.raw_intent,
         playback_started=res.playback_started,
+        queued_count=int(res.queued_count or 0),
         device_id=res.device_id,
         error=res.error if not res.ok else None,
         playback_error=res.playback_error,
@@ -873,6 +861,8 @@ async def lights_nanoleaf_state(body: NanoleafStateRequest):
         raise HTTPException(status_code=400, detail="state must be 'on' or 'off'")
     try:
         stop_auto_lighting_sync(log_fn=_log_event)
+        # Manual controls should invalidate remembered custom-flow speed context.
+        clear_last_nanoleaf_flow()
         if state == "on":
             turn_on()
         else:
@@ -889,6 +879,8 @@ async def lights_nanoleaf_scene(body: NanoleafSceneRequest):
     if not scene:
         raise HTTPException(status_code=400, detail="scene must be non-empty")
     try:
+        # Manual scene selection supersedes any remembered custom flow.
+        clear_last_nanoleaf_flow()
         set_effect(scene)
         return {"success": True, "scene": scene, "auto_sync_live": is_auto_lighting_sync_live()}
     except Exception as e:
@@ -899,6 +891,8 @@ async def lights_nanoleaf_scene(body: NanoleafSceneRequest):
 async def lights_nanoleaf_brightness(body: NanoleafBrightnessRequest):
     try:
         stop_auto_lighting_sync(log_fn=_log_event)
+        # Manual panel controls should not keep stale flow context for later speed commands.
+        clear_last_nanoleaf_flow()
         level = max(0, min(100, int(body.brightness)))
         set_nanoleaf_brightness(level)
         return {"success": True, "brightness": level, "auto_sync_live": is_auto_lighting_sync_live()}
@@ -1015,6 +1009,63 @@ async def shopping_items_replace_all(body: ShoppingReplaceAllRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/shopping/recipes")
+async def shopping_recipes_get():
+    try:
+        return {"recipes": recipes_list()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shopping/recipes")
+async def shopping_recipes_post(body: RecipeCreateRequest):
+    try:
+        ings = [i.model_dump() for i in body.ingredients]
+        recipe = recipes_create(body.name, ings)
+        return {"success": True, "recipe": recipe}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/shopping/recipes/{recipe_id}")
+async def shopping_recipes_patch(recipe_id: str, body: RecipeUpdateRequest):
+    try:
+        ings = [i.model_dump() for i in body.ingredients] if body.ingredients is not None else None
+        recipe = recipes_update(recipe_id, name=body.name, ingredients=ings)
+        return {"success": True, "recipe": recipe}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="recipe not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/shopping/recipes/{recipe_id}")
+async def shopping_recipes_delete(recipe_id: str):
+    try:
+        recipes_delete(recipe_id)
+        return {"success": True}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="recipe not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shopping/recipes/{recipe_id}/apply")
+async def shopping_recipes_apply(recipe_id: str):
+    """Merge recipe ingredients into the shopping list (sums quantities for matching names)."""
+    try:
+        items = recipes_apply_to_shopping(recipe_id)
+        return {"success": True, "items": items}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="recipe not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/weather/forecast", response_model=WeatherResponse)
 async def weather_forecast():
     """Today forecast summary (peak temp/time + rain likelihood)."""
@@ -1067,6 +1118,7 @@ async def chat(body: ChatRequest):
         raise HTTPException(status_code=400, detail="message must be non-empty")
     try:
         if looks_like_spotify_pause_request(message):
+            logger.info("chat: spotify pause intent matched message=%r", message)
             ok, detail, dev = await asyncio.to_thread(pause_spotify_playback)
             if ok:
                 return ChatResponse(
@@ -1080,49 +1132,31 @@ async def chat(body: ChatRequest):
                 timing=_merge_chat_timing(path="spotify_pause"),
             )
 
-        # Spotify before generic \"Play …\" so voice/phone requests can still work.
-        explicit_spotify = "spotify" in (message or "").lower()
+        if looks_like_spotify_skip_request(message):
+            logger.info("chat: spotify skip intent matched message=%r", message)
+            ok, detail, dev = await asyncio.to_thread(skip_spotify_track)
+            if ok:
+                return ChatResponse(
+                    reply="Skipped to the next track.",
+                    spotify=SpotifyPlayPayload(ok=True, kind="control", device_id=dev),
+                    timing=_merge_chat_timing(path="spotify_skip"),
+                )
+            return ChatResponse(
+                reply=_sanitize_app_reply(f"I couldn't skip the track: {detail or 'unknown error'}"),
+                spotify=SpotifyPlayPayload(ok=False, kind="control", device_id=dev, playback_error=detail),
+                timing=_merge_chat_timing(path="spotify_skip"),
+            )
+
+        # Spotify is the only music playback path.
         if looks_like_spotify_play_request(message):
             t0 = time.perf_counter()
             sp_res = await asyncio.to_thread(resolve_spotify_play, message)
             resolve_ms = (time.perf_counter() - t0) * 1000
-            # Soft fallback: if Spotify didn't start and user didn't explicitly ask for Spotify, use YouTube.
-            if (not sp_res.ok or not sp_res.playback_started) and not explicit_spotify and looks_like_play_music_request(message):
-                yt_res = await asyncio.to_thread(resolve_play_to_video_id, message)
-                yt_reply = format_play_resolution_reply(yt_res)
-                yt_payload = _music_search_payload(yt_res)
-                return ChatResponse(
-                    reply=_sanitize_app_reply(yt_reply),
-                    music=yt_payload,
-                    timing=_merge_chat_timing(path="youtube_fallback", extra={"resolve_ms": round(resolve_ms, 1)}),
-                )
             reply = format_spotify_resolution_reply(sp_res)
             return ChatResponse(
                 reply=_sanitize_app_reply(reply),
                 spotify=_spotify_play_payload(sp_res),
                 timing=_merge_chat_timing(path="spotify", extra={"resolve_ms": round(resolve_ms, 1)}),
-            )
-        # YouTube \"Play …\" → search → video_id (Pi / player hooks in later).
-        if looks_like_play_music_request(message):
-            t0 = time.perf_counter()
-            res = await asyncio.to_thread(resolve_play_to_video_id, message)
-            resolve_ms = (time.perf_counter() - t0) * 1000
-            reply = format_play_resolution_reply(res)
-            return ChatResponse(
-                reply=_sanitize_app_reply(reply),
-                music=_music_search_payload(res),
-                timing=_merge_chat_timing(path="youtube", extra={"resolve_ms": round(resolve_ms, 1)}),
-            )
-
-        # D&D safety guard: prefer the dedicated D&D page for campaign Q&A.
-        t = message.lower()
-        dnd_terms = ("players", "dm", "table", "campaign", "session", "fort", "commander", "quest", "solria", "ter")
-        lighting_terms = ("lights", "nanoleaf", "govee", "brightness", "color", "animation", "scene")
-        if any(k in t for k in dnd_terms) and not any(k in t for k in lighting_terms):
-            return ChatResponse(
-                reply="For questions about your D&D campaign, open /dnd and use the question box (it searches your campaign notes).",
-                nanoleaf_flow=None,
-                timing=_merge_chat_timing(path="dnd_guard"),
             )
 
         # Custom / flow animations: never instant-ack (force_full is redundant with _use_background_lighting_ack).
@@ -1133,9 +1167,10 @@ async def chat(body: ChatRequest):
 
         is_bg_light, alias_key = _looks_like_background_lighting_action(message)
         if is_bg_light and _use_background_lighting_ack(message) and not force_full:
+            effective_name = (body.user_name or "").strip() or "Guest"
             threading.Thread(
                 target=_run_background_action,
-                args=(message,),
+                args=(message, effective_name),
                 daemon=True,
                 name="galadrial-bg-action",
             ).start()
@@ -1166,31 +1201,6 @@ async def chat(body: ChatRequest):
         )
     except Exception as e:
         logger.exception("Chat failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/music/prepare", response_model=MusicPrepareResponse)
-async def music_prepare(body: MusicPrepareRequest):
-    """
-    Resolve \"Play …\" → YouTube search → ``video_id``. Same as POST /chat for play phrases,
-    without the rest of routing. (HTTP call to your Pi is not wired here yet.)
-    """
-    phrase = (body.phrase or "").strip()
-    if not phrase:
-        raise HTTPException(status_code=400, detail="phrase must be non-empty")
-    if not looks_like_play_music_request(phrase):
-        raise HTTPException(
-            status_code=400,
-            detail='phrase must look like a play request (e.g. "Play artist name")',
-        )
-    try:
-        res = await asyncio.to_thread(resolve_play_to_video_id, phrase)
-        return MusicPrepareResponse(
-            reply=_sanitize_app_reply(format_play_resolution_reply(res)),
-            music=_music_search_payload(res),
-        )
-    except Exception as e:
-        logger.exception("music/prepare failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1242,6 +1252,7 @@ async def music_spotify_prepare(body: SpotifyPrepareRequest):
             skip_llm_refinement=body.skip_llm_refinement,
             attempt_playback=body.attempt_playback,
             device_id=body.device_id,
+            queue_size=body.queue_size,
         )
         return SpotifyPrepareResponse(
             reply=_sanitize_app_reply(format_spotify_resolution_reply(res)),
@@ -1531,14 +1542,12 @@ def get_client_html() -> str:
         _lastProfileContext = { serverTiming: data.timing || null, local: localExtra };
         renderResponseProfile(data.timing, localExtra);
         append('assistant', data.reply || 'No response.');
-        if (data.music && data.music.video_id) {
-          append('assistant', 'YouTube video id: ' + data.music.video_id, false, true);
-        }
         if (data.spotify && data.spotify.uri) {
           const s = data.spotify;
-          let line = 'Spotify ' + (s.kind || 'track') + ': ' + (s.name || s.uri);
+          let line = 'Spotify playback prepared';
           if (s.playback_started) line += ' (playback started)';
           else if (s.playback_error) line += ' (playback: ' + s.playback_error + ')';
+          if (s.queued_count && s.queued_count > 0) line += ' + queued ' + s.queued_count + ' more';
           if (s.device_id) line += ' [device ' + s.device_id + ']';
           append('assistant', line, false, true);
         }

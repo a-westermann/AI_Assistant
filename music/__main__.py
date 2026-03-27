@@ -1,10 +1,8 @@
-"""
-CLI: ``python -m music "Play Polica"`` (same as ``python -m music.play_resolver``).
-"""
+"""CLI helper: run Spotify OAuth setup."""
 
 from __future__ import annotations
 
-from .play_resolver import run_cli
+from .spotify_auth import main
 
 if __name__ == "__main__":
-    run_cli()
+    main()

@@ -142,6 +142,28 @@ def spotify_auth_interactive() -> None:
     reset_spotify_client()
 
 
+def get_active_playback_device_id(sp=None) -> str | None:
+    """
+    Return the device id from GET /v1/me/player when there is an active playback session.
+
+    This often works for librespot even when GET /v1/me/player/devices does not list the Pi,
+    so pause/transfer can target the correct Connect device.
+    """
+    sp = sp or get_spotify()
+    try:
+        cp = sp.current_playback()
+    except Exception:
+        return None
+    if not isinstance(cp, dict):
+        return None
+    dev = cp.get("device")
+    if isinstance(dev, dict):
+        did = dev.get("id")
+        if isinstance(did, str) and did.strip():
+            return did.strip()
+    return None
+
+
 def list_connect_devices(sp=None) -> list[dict[str, Any]]:
     """Devices visible to Spotify Connect (find your Pi / librespot ``id`` for SPOTIFY_DEVICE_ID)."""
     sp = sp or get_spotify()
@@ -182,6 +204,22 @@ def search_albums(sp, q: str, *, limit: int = 5) -> list[dict[str, Any]]:
     return [a for a in al if isinstance(a, dict)] if isinstance(al, list) else []
 
 
+def search_artists(sp, q: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    r = sp.search(q=q, type="artist", limit=limit)
+    items = (r.get("artists") or {}).get("items")
+    return [a for a in items if isinstance(a, dict)] if isinstance(items, list) else []
+
+
+def artist_top_tracks(sp, artist_id: str, *, country: str | None = None) -> list[dict[str, Any]]:
+    """
+    Spotify returns up to 10 top tracks for the artist (market from ``SPOTIFY_MARKET`` or ``US``).
+    """
+    c = (country or os.environ.get("SPOTIFY_MARKET") or "US").strip()
+    r = sp.artist_top_tracks(artist_id, country=c)
+    tracks = r.get("tracks")
+    return [t for t in tracks if isinstance(t, dict)] if isinstance(tracks, list) else []
+
+
 def track_artists_label(track: dict) -> str:
     arts = track.get("artists")
     if not isinstance(arts, list):
@@ -193,7 +231,8 @@ def track_artists_label(track: dict) -> str:
 def start_playback(
     sp,
     *,
-    uri: str,
+    uri: str | None = None,
+    uris: list[str] | None = None,
     kind: str,
     device_id: str | None = None,
 ) -> None:
@@ -212,6 +251,73 @@ def start_playback(
             logger.warning("spotify_client: transfer_playback failed for device %r: %s", device_id, e)
         kwargs["device_id"] = device_id
     if kind == "track":
-        sp.start_playback(uris=[uri], **kwargs)
+        if isinstance(uris, list) and uris:
+            if len(uris) > 1:
+                # Multi-track ``uris`` in one start_playback call makes some Connect targets
+                # (notably librespot) load the first track then immediately skip to the second.
+                sp.start_playback(uris=[uris[0]], **kwargs)
+                dev = kwargs.get("device_id")
+                time.sleep(0.2)
+                for quri in uris[1:]:
+                    if not isinstance(quri, str) or not quri:
+                        continue
+                    try:
+                        sp.add_to_queue(quri, device_id=dev)
+                    except Exception as e:
+                        logger.warning("spotify_client: add_to_queue failed for %r: %s", quri, e)
+                    time.sleep(0.05)
+            else:
+                sp.start_playback(uris=uris, **kwargs)
+        elif isinstance(uri, str) and uri:
+            sp.start_playback(uris=[uri], **kwargs)
+        else:
+            raise ValueError("track playback requires uri or uris")
     else:
+        if not isinstance(uri, str) or not uri:
+            raise ValueError("context playback requires uri")
         sp.start_playback(context_uri=uri, **kwargs)
+
+
+def skip_to_next_track(sp, *, device_id: str | None = None) -> None:
+    """
+    Skip to the next track on the active (or specified) Connect device.
+    Uses the same transfer-then-command pattern as :func:`pause_user_playback` for librespot.
+    """
+    if device_id:
+        try:
+            sp.transfer_playback(device_id=device_id, force_play=False)
+            time.sleep(0.25)
+        except Exception as e:
+            logger.warning(
+                "spotify_client: transfer_playback before skip failed for %r: %s",
+                device_id,
+                e,
+            )
+        sp.next_track(device_id=device_id)
+    else:
+        sp.next_track()
+
+
+def pause_user_playback(sp, *, device_id: str | None = None) -> None:
+    """
+    Pause playback on a Connect device the same way we *start* playback: transfer the
+    active session to that device first, then pause the active player.
+
+    Calling ``pause_playback(device_id=...)`` alone is unreliable for some Connect
+    targets (e.g. librespot): Spotify may accept the HTTP call but not route SPIRC
+    pause to the speaker. Priming with ``transfer_playback(..., force_play=False)``
+    matches our ``start_playback`` path and fixes that.
+    """
+    if device_id:
+        try:
+            sp.transfer_playback(device_id=device_id, force_play=False)
+            time.sleep(0.35)
+        except Exception as e:
+            logger.warning(
+                "spotify_client: transfer_playback before pause failed for %r: %s",
+                device_id,
+                e,
+            )
+        sp.pause_playback()
+    else:
+        sp.pause_playback()

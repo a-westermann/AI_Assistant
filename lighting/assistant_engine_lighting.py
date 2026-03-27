@@ -179,20 +179,20 @@ def pick_nanoleaf_scene(description: str, scene_list: list[str], log_fn) -> str 
 
 def infer_flow_speed(user_text: str) -> float:
     """
-    Map natural language to Nanoleaf flow speed parameter (0.5–5.0).
-    Higher values = faster motion (see nanoleaf.create_flow_effect).
+    Map natural language to Nanoleaf transition-style speed value.
+    Lower values = faster motion (e.g. 0.1 is very fast), higher = slower.
     """
     t = (user_text or "").lower()
     if "really slow" in t or "very slow" in t or "super slow" in t:
-        return 0.5
+        return 4.5
     if "really fast" in t or "super fast" in t or "very fast" in t:
-        return 5.0
+        return 0.2
     if "maximum speed" in t or "max speed" in t or "as fast as" in t:
-        return 5.0
+        return 0.1
     if any(w in t for w in ("slow", "slowly", "gentle", "calm", "leisurely", "subtle")):
-        return 0.85
+        return 3.0
     if any(w in t for w in ("fast", "quick", "quickly", "snappy", "rapid", "speedy")):
-        return 3.75
+        return 0.7
     return 1.0
 
 
@@ -217,13 +217,25 @@ def persist_last_nanoleaf_flow(user_name: str | None, colors_hex: list[str], spe
             norm.append("#" + s.upper())
     if len(norm) < 2:
         return
-    sp = max(0.5, min(5.0, round(float(speed), 1)))
+    sp = max(0.1, min(5.0, round(float(speed), 2)))
     _LAST_NANOLEAF_FLOW_BY_USER[_flow_state_user_key(user_name)] = {"colors": norm, "speed": sp}
 
 
 def get_last_nanoleaf_flow(user_name: str | None) -> dict[str, Any] | None:
     """Snapshot {colors: [#RRGGBB, ...], speed} or None."""
     return _LAST_NANOLEAF_FLOW_BY_USER.get(_flow_state_user_key(user_name))
+
+
+def clear_last_nanoleaf_flow(user_name: str | None = None) -> None:
+    """
+    Clear remembered custom flow state.
+    - user_name=None: clear all users
+    - user_name provided: clear only that user's flow snapshot
+    """
+    if user_name is None:
+        _LAST_NANOLEAF_FLOW_BY_USER.clear()
+        return
+    _LAST_NANOLEAF_FLOW_BY_USER.pop(_flow_state_user_key(user_name), None)
 
 
 def infer_flow_colors_hex(user_text: str) -> list[str]:
@@ -578,6 +590,23 @@ def try_handle_lighting_action(
     if action == "nanoleaf.create_animation":
         raw_colors = params.get("colors")
         desc = str(params.get("description") or user_text or "").strip()
+        lower_intent = f"{desc} {user_text}".lower()
+        # Speed-only follow-ups should not call Govee (avoid unnecessary API usage/call limits).
+        is_speed_only_adjust = any(
+            p in lower_intent
+            for p in (
+                "faster",
+                "slower",
+                "speed up",
+                "slow down",
+                "as fast as possible",
+                "as slow as possible",
+                "max speed",
+                "min speed",
+                "maximum speed",
+                "minimum speed",
+            )
+        )
         hex_list: list[str] = []
         if isinstance(raw_colors, list):
             for c in raw_colors:
@@ -605,7 +634,7 @@ def try_handle_lighting_action(
                 speed = None
             if speed is None:
                 speed = infer_flow_speed(f"{desc} {user_text}")
-            speed = max(0.5, min(5.0, round(speed, 1)))
+            speed = max(0.1, min(5.0, round(speed, 2)))
             try:
                 ok = nanoleaf.create_flow_effect(colors_rgb, speed)
                 if ok:
@@ -616,7 +645,7 @@ def try_handle_lighting_action(
                         speed,
                     )
                     first_hex = hex_list[0] if hex_list else None
-                    if first_hex:
+                    if first_hex and not is_speed_only_adjust:
                         try:
                             set_lights_style(state="on", color_hex=first_hex, brightness=75)
                             engine.log("Govee set to match animation color.")
@@ -625,8 +654,8 @@ def try_handle_lighting_action(
                     return engine._call_model(
                         user_text,
                         None,
-                        extra_note="System note: A new flowing animation was created on the Nanoleaf panels with the chosen colors and speed."
-                        + (" Govee lights were also set to match." if first_hex else "") + "\n\n",
+                        extra_note="System note: A flowing animation was applied on the Nanoleaf panels with the chosen colors and speed."
+                        + (" Govee lights were also set to match." if (first_hex and not is_speed_only_adjust) else "") + "\n\n",
                     )
                 engine.log("Nanoleaf create_flow_effect returned False (API may have rejected the effect).")
             except Exception as e:

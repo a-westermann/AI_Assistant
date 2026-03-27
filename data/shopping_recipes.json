@@ -1,0 +1,50 @@
+{
+  "recipes": [
+    {
+      "id": "95f7f2d8-a97c-4137-ba49-f03b06fdc9b9",
+      "name": "taco",
+      "ingredients": [
+        {
+          "id": "b3455af7-0b05-408c-a8d0-324d9742a1f0",
+          "name": "meat",
+          "normalized_name": "meat",
+          "quantity": 1
+        }
+      ],
+      "created_at": "2026-03-27T21:34:10.760213+00:00",
+      "updated_at": "2026-03-27T21:34:10.760213+00:00"
+    },
+    {
+      "id": "f3c24f58-2ffa-4b6b-aa24-74aa1a51cc5f",
+      "name": "curry",
+      "ingredients": [
+        {
+          "id": "deb9be29-d918-4e5b-ab71-dfb66bd2a3fe",
+          "name": "chicken thighs",
+          "normalized_name": "chicken thighs",
+          "quantity": 1
+        },
+        {
+          "id": "ffe6f2e1-4e4c-4cde-87fe-e1286dcb7919",
+          "name": "bell pepper",
+          "normalized_name": "bell pepper",
+          "quantity": 2
+        },
+        {
+          "id": "afc71d49-f534-4752-9760-16e38d1f11e1",
+          "name": "heavy cream",
+          "normalized_name": "heavy cream",
+          "quantity": 1
+        },
+        {
+          "id": "831b9560-42ed-4d1a-90f1-238ce13ccb54",
+          "name": "sweet potatoes",
+          "normalized_name": "sweet potatoes",
+          "quantity": 2
+        }
+      ],
+      "created_at": "2026-03-27T21:35:07.825396+00:00",
+      "updated_at": "2026-03-27T21:35:07.825396+00:00"
+    }
+  ]
+}

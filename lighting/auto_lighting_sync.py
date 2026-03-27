@@ -88,6 +88,29 @@ def _kelvin_to_rgb(temp_k: int) -> tuple[int, int, int]:
     return r, g, b
 
 
+def _nanoleaf_warm_bias_factor(
+    sunrise_dt: datetime,
+    sunset_dt: datetime,
+    current_dt: datetime | None = None,
+) -> float:
+    """
+    Return extra warmth bias for Nanoleaf relative to Govee auto temperature.
+    0.10 baseline most of day, rising toward 0.30 near sunrise/sunset.
+    """
+    now = current_dt or datetime.utcnow()
+    # Distance to nearest transition in seconds.
+    nearest = min(
+        abs((now - sunrise_dt).total_seconds()),
+        abs((now - sunset_dt).total_seconds()),
+    )
+    # Within 3 hours of sunrise/sunset, ramp from 0.10 -> 0.30.
+    window = 3 * 60 * 60
+    if nearest >= window:
+        return 0.10
+    closeness = 1.0 - (nearest / window)  # 0 far, 1 near transition
+    return 0.10 + 0.20 * closeness
+
+
 def _fetch_sun_times_utc() -> tuple[datetime, datetime]:
     lat, lon = _get_coords()
     url = (
@@ -115,14 +138,21 @@ def _fetch_sun_times_utc() -> tuple[datetime, datetime]:
 def _apply_nanoleaf_auto_profile(log_fn: Callable[[str], None] | None = None) -> dict:
     sunrise_dt, sunset_dt = _fetch_sun_times_utc()
     now = datetime.utcnow().replace(tzinfo=sunrise_dt.tzinfo)
-    temp_k = _calculate_light_temperature(sunrise_dt, sunset_dt, now)
+    govee_temp_k = _calculate_light_temperature(sunrise_dt, sunset_dt, now)
+    warm_bias = _nanoleaf_warm_bias_factor(sunrise_dt, sunset_dt, now)
+    min_temp = 2700
+    # Keep Nanoleaf warmer than Govee auto, especially around sunrise/sunset.
+    temp_k = int(round(min_temp + (govee_temp_k - min_temp) * (1.0 - warm_bias)))
     brightness = _calculate_brightness(sunrise_dt, sunset_dt, now)
     r, g, b = _kelvin_to_rgb(temp_k)
     nanoleaf.turn_on()
     nanoleaf.set_color_rgb(r, g, b)
     nanoleaf.set_brightness(int(brightness))
     if log_fn:
-        log_fn(f"Nanoleaf auto sync applied: {temp_k}K, {brightness}%")
+        log_fn(
+            f"Nanoleaf auto sync applied: {temp_k}K, {brightness}% "
+            f"(govee_base={govee_temp_k}K, warm_bias={warm_bias:.2f})"
+        )
     return {"temperature_k": int(temp_k), "brightness": int(brightness)}
 
 
