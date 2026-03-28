@@ -9,6 +9,12 @@ Environment:
   SPOTIFY_TOKEN_CACHE — path to token cache file (default: .cache-spotify in repo root)
   SPOTIFY_DEVICE_ID — optional default Connect device id (your Pi / librespot). If unset,
     Spotify uses the active device, which may not be the Pi.
+  SPOTIFY_SKIP_QUEUE_CLEAR — if ``1``/``true``, do not drain the Connect queue before
+    starting new playback (tracks, album, or playlist). Not recommended: old queue items
+    can still play after the current context ends.
+  SPOTIFY_USE_BULK_URIS_PLAYBACK — if ``1``/``true``, send all track URIs in one
+    ``start_playback`` call (can confuse librespot; default is first track + ``add_to_queue``
+    for the rest, after ``clear_playback_queue``).
 
 Interactive login (once): run ``python -m music.spotify_auth`` from a terminal on the PC.
 The API does not start OAuth during HTTP requests (that would hang the browser / worker).
@@ -228,6 +234,63 @@ def track_artists_label(track: dict) -> str:
     return ", ".join(names)
 
 
+def clear_playback_queue(
+    sp,
+    *,
+    device_id: str | None = None,
+    max_skips: int = 64,
+) -> int:
+    """
+    Spotify has no API to clear the user's playback queue. Approximate a reset by pausing,
+    then calling ``next_track`` until ``GET /me/player/queue`` reports an empty ``queue``
+    list (capped at ``max_skips``). Call after ``transfer_playback`` so the target device
+    matches. Some Connect targets may play a short burst when advancing.
+    """
+    try:
+        sp.pause_playback(device_id=device_id)
+    except Exception as e:
+        logger.debug("clear_playback_queue: pause failed (idle session is ok): %s", e)
+    time.sleep(0.28)
+    skips = 0
+    for _ in range(max(1, int(max_skips))):
+        try:
+            data = sp.queue()
+        except Exception as e:
+            logger.warning("clear_playback_queue: queue() failed: %s", e)
+            break
+        if not isinstance(data, dict):
+            break
+        upcoming = data.get("queue")
+        if not isinstance(upcoming, list) or len(upcoming) == 0:
+            break
+        try:
+            sp.next_track(device_id=device_id)
+        except Exception as e:
+            logger.warning("clear_playback_queue: next_track failed: %s", e)
+            break
+        skips += 1
+        time.sleep(0.14)
+    try:
+        tail = sp.queue()
+        up = tail.get("queue") if isinstance(tail, dict) else None
+        if isinstance(up, list) and len(up) > 0:
+            logger.warning(
+                "clear_playback_queue: %d item(s) still in queue after drain (cap=%s)",
+                len(up),
+                max_skips,
+            )
+    except Exception:
+        pass
+    try:
+        sp.pause_playback(device_id=device_id)
+    except Exception:
+        pass
+    time.sleep(0.12)
+    if skips:
+        logger.info("spotify_client: drained %d queued track(s) before new playback", skips)
+    return skips
+
+
 def start_playback(
     sp,
     *,
@@ -238,6 +301,9 @@ def start_playback(
 ) -> None:
     """
     ``kind`` is ``track`` | ``playlist`` | ``album``.
+
+    Unless ``SPOTIFY_SKIP_QUEUE_CLEAR`` is set, always runs ``clear_playback_queue`` first
+    so album/playlist playback does not inherit stale queued tracks from earlier sessions.
     """
     kwargs: dict[str, Any] = {}
     if device_id:
@@ -250,13 +316,30 @@ def start_playback(
         except Exception as e:
             logger.warning("spotify_client: transfer_playback failed for device %r: %s", device_id, e)
         kwargs["device_id"] = device_id
+
+    skip_clear = (os.environ.get("SPOTIFY_SKIP_QUEUE_CLEAR") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    dev = kwargs.get("device_id")
+    if not skip_clear:
+        # Any new play (tracks, album, or playlist) should not inherit yesterday's queue.
+        clear_playback_queue(sp, device_id=dev)
+
     if kind == "track":
+        bulk = (os.environ.get("SPOTIFY_USE_BULK_URIS_PLAYBACK") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         if isinstance(uris, list) and uris:
-            if len(uris) > 1:
-                # Multi-track ``uris`` in one start_playback call makes some Connect targets
-                # (notably librespot) load the first track then immediately skip to the second.
+            if len(uris) > 1 and bulk:
+                sp.start_playback(uris=uris, **kwargs)
+            elif len(uris) > 1:
+                # Librespot often mishandles multiple URIs in one call; add_to_queue appends
+                # to the *end* of the queue — we drain the queue above so "next" is only our list.
                 sp.start_playback(uris=[uris[0]], **kwargs)
-                dev = kwargs.get("device_id")
                 time.sleep(0.2)
                 for quri in uris[1:]:
                     if not isinstance(quri, str) or not quri:

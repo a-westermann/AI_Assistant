@@ -46,11 +46,12 @@ TOOLS = [
     },
     {
         "name": "nanoleaf.create_animation",
-        "description": "CREATE a flowing/animated color effect on Nanoleaf (colors cycle across panels). Use for 'create animation', 'custom animation', 'new animation', 'rainbow', 'flow', 'cycle colors', 'red and blue alternating', any request for moving/changing colors over time. Pick 2–6 hex colors in params.colors (e.g. #FF0000, #0000FF); if unsure, use red+blue or a rainbow set. Do NOT use for solid/static single color—use nanoleaf.custom.",
+        "description": "CREATE a flowing/animated color effect on Nanoleaf (colors cycle across panels). Use for 'create animation', 'new animation', 'rainbow', flow/cycle, explicit colors, OR a thematic reference (game, movie, show, mood) with no hex colors—put the full user context in description and omit or partially fill colors so the backend can infer a palette. Examples: 'Resident Evil vibe', 'we are playing X', 'animation that fits this movie'. Pick 2–6 hex colors in params.colors when the user names colors; otherwise leave colors empty or minimal and rely on description. Do NOT use for solid/static single color—use nanoleaf.custom.",
         "params": [
             {"name": "animation_type", "type": "string", "description": "One of: flow"},
-            {"name": "colors", "type": "array", "description": 'List of hex color strings, e.g. ["#FF0000", "#00FF00", "#0000FF"]. Need at least 2 for flow.'},
+            {"name": "colors", "type": "array", "description": 'List of hex color strings, e.g. ["#FF0000", "#00FF00"]. At least 2 when user names colors; can be empty if inferring from description/theme.'},
             {"name": "speed", "type": "number", "description": "Optional. Transition speed 0.5–5 (seconds). Default 1."},
+            {"name": "description", "type": "string", "description": "Full user request for context—required when inferring colors from a game/movie/mood reference without explicit color names."},
         ],
     },
     {

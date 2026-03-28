@@ -130,7 +130,7 @@ def _needs_full_lighting_chat_sync(text: str) -> bool:
     t = (text or "").lower()
     if re.search(r"\banimation|animating|animated\b|\banimate\b", t):
         return True
-    if "rainbow" in t or "pride" in t:
+    if "rainbow" in t:
         return True
     if "multicolor" in t or "multi-color" in t or "multi color" in t:
         return True

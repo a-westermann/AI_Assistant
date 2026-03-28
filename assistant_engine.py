@@ -41,6 +41,7 @@ from lighting.assistant_engine_lighting import (
     infer_flow_colors_hex,
     infer_flow_speed,
     persist_last_nanoleaf_flow,
+    resolve_nanoleaf_flow_colors,
     try_handle_lighting_action,
 )
 from lighting.auto_lighting_sync import start_auto_lighting_sync, stop_auto_lighting_sync
@@ -661,7 +662,7 @@ Hard rules:
 - If user mentions a color name, convert it to a reasonable hex (green=#00FF00, orange=#FFA500, purple=#800080, etc.).
 - If user mentions a percent, set brightness to that number. If user says dim/dimmer/dark -> 20-40. bright/brighter/max -> 80-100.
 - If brightness is not mentioned, brightness may be null.
-- For type \"animation\" you MUST set \"colors_hex\" to an array of at least 2 hex strings. Examples: rainbow -> 6+ distinct hues (#FF0000, #FF8800, #FFFF00, #00FF00, #0088FF, #8800FF); red and blue -> [\"#FF0000\", \"#0000FF\"]. Never leave colors_hex empty for animation.
+- For type \"animation\" set \"colors_hex\" to at least 2 hex strings when the user names specific colors (in order; no extra colors beyond what they asked). Rainbow -> 6+ distinct hues. If they reference a game, movie, show, book, or mood without naming colors (e.g. \"animation for Resident Evil\", \"match what we're playing\"), you may set \"colors_hex\" to [] or omit it—the system will infer a palette (and optional pacing) from the full user message.
 
 User: \"{user_text}\"
 
@@ -733,7 +734,7 @@ Reply with JSON only (no markdown)."""
                 else:
                     out["colors_hex"] = []
                 if len(out["colors_hex"]) < 2:
-                    out["colors_hex"] = infer_flow_colors_hex(user_text)[:6]
+                    out["colors_hex"] = infer_flow_colors_hex(user_text, self.log)[:6]
                 sp = a.get("speed")
                 try:
                     out["speed"] = (
@@ -908,7 +909,7 @@ Reply with JSON only (no markdown)."""
             except Exception:
                 current_effect = None
             if isinstance(current_effect, str) and current_effect.strip():
-                derived = infer_flow_colors_hex(current_effect.strip())
+                derived = infer_flow_colors_hex(current_effect.strip(), None)
                 if isinstance(derived, list) and len(derived) >= 2:
                     prev_params = {
                         "colors": derived[:6],
@@ -1063,13 +1064,47 @@ Reply with JSON only (no markdown)."""
         if self._is_memory_request(user_text):
             return None
         t = (user_text or "").lower().strip()
-        if not (
-            ("animation" in t or "animate" in t)
-            and any(k in t for k in ("create", "custom", "make", "new", "build", "add"))
-        ) and not ("rainbow" in t and ("animation" in t or "animate" in t or "color" in t)):
+        has_anim = "animation" in t or "animate" in t
+        has_action = any(
+            k in t
+            for k in (
+                "create",
+                "custom",
+                "make",
+                "new",
+                "build",
+                "add",
+                "set",
+                "give",
+                "start",
+                "want",
+            )
+        )
+        rainbow_ok = ("rainbow" in t) and has_anim and (
+            "color" in t or "animate" in t or "animation" in t
+        )
+        theme_ok = any(
+            p in t
+            for p in (
+                "relevant animation",
+                "animation that fits",
+                "animation that matches",
+                "animation for",
+                "animation to match",
+                "animation to go with",
+                "animation based",
+                "matching animation",
+                "suitable animation",
+                "animation inspired",
+            )
+        )
+        playing_ok = ("playing" in t or "watching" in t or "we're" in t or "we are" in t) and has_anim and (
+            "light" in t or "nanoleaf" in t or "panel" in t
+        )
+
+        if not (rainbow_ok or (has_anim and has_action) or theme_ok or playing_ok):
             return None
-        colors = infer_flow_colors_hex(user_text)
-        spd = infer_flow_speed(user_text)
+        colors, spd = resolve_nanoleaf_flow_colors(user_text, self.log)
         self.log(f"Heuristic flow animation; colors={colors} speed={spd}")
         return {
             "action": "nanoleaf.create_animation",
@@ -1077,6 +1112,7 @@ Reply with JSON only (no markdown)."""
                 "animation_type": "flow",
                 "colors": colors,
                 "speed": spd,
+                "description": user_text.strip(),
             },
         }
 
@@ -1140,6 +1176,7 @@ Interpret intent from the actual request. Examples:
 - "set the nanoleaf to romantic" (mood that matches a scene) → nanoleaf.set_scene
 - "static purple" / "no animation, just blue" / "solid red" / "make them purple but not animated" → nanoleaf.custom (params.description = their full request). They want a single static color, no flowing animation.
 - "create a new animation" / "flowing red and blue" / "make them cycle through colors" / "new animation with yellow" → nanoleaf.create_animation with colors and optional speed. They want movement/animation.
+- "animation that fits Resident Evil" / "we're playing X, create a relevant animation" / "lights to match this game" → nanoleaf.create_animation with params.description = their full message (colors optional/empty so the app can infer a thematic palette).
 - "add a strong pulse" / "pulse" / "make up your own settings" → nanoleaf.custom.
 - "make it faster" / "pulse faster" / "speed it up" / "slower" (after a custom Nanoleaf flow was applied) → nanoleaf.create_animation again with the same colors and new speed (the app may also handle this without you).
 - "turn the nanoleaf off" / "nanoleaf on" / "turn off the nanoleaf" → nanoleaf.set_state with state "off" or "on" (ONLY Nanoleaf; do NOT change Govee). Do NOT use nanoleaf.custom for this.
@@ -1149,7 +1186,7 @@ Interpret intent from the actual request. Examples:
 - "run Plex sync" → plex_sync.run
 - "remember that writing mode means dim orange lights" → memory.remember (key: "writing mode", value: "dim orange lights")
 
-If the user said "again" or "same thing", repeat the previous action. Do not choose "none" when the user is asking you to change the lights or set a mood—use lights.set_scene or nanoleaf.set_scene as appropriate. If they ask to "create a new animation" or "create an animation for the lights", always use nanoleaf.create_animation with colors (and optional speed)—never respond with a list of settings for them to enter in an app.
+If the user said "again" or "same thing", repeat the previous action. Do not choose "none" when the user is asking you to change the lights or set a mood—use lights.set_scene or nanoleaf.set_scene as appropriate. If they ask to "create a new animation" or "create an animation for the lights", always use nanoleaf.create_animation (colors when they name colors; otherwise description + empty colors for theme-based inference)—never respond with a list of settings for them to enter in an app.
 
 Previous user message: "{prev_msg}"
 Previous action: {prev_action}

@@ -4,8 +4,10 @@ Lighting action handlers extracted from assistant_engine.py.
 
 from __future__ import annotations
 
+import colorsys
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 from llm import ask_lmstudio
@@ -196,6 +198,78 @@ def infer_flow_speed(user_text: str) -> float:
     return 1.0
 
 
+def pick_flow_palette_for_reference(
+    context: str, log_fn: Callable[[str], None]
+) -> tuple[list[str], float | None] | None:
+    """
+    Use the LLM to map a game / movie / show / book / mood reference (no explicit color names required)
+    to 2–6 hex colors for a Nanoleaf flowing animation. Optionally returns a speed hint (0.1 fast … 5 slow).
+    """
+    ctx = (context or "").strip()
+    if len(ctx) < 12:
+        return None
+    prompt = (
+        "The user wants a FLOWING / ANIMATED multi-color effect on smart light panels (Nanoleaf) that fits "
+        "this situation, activity, or reference:\n\n"
+        f'"{ctx}"\n\n'
+        "Pick 2 to 6 distinct HTML hex colors (#RRGGBB) that evoke the look and mood—think iconic palette, "
+        "lighting, atmosphere, or brand colors associated with that reference. "
+        "Use saturated, panel-friendly colors (avoid many near-duplicates). "
+        "Optionally set \"speed\": a number from 0.1 (fast, energetic) to 5.0 (slow, calm) for how quickly "
+        "colors should transition—match the pacing of the reference (horror often slower, arcade/brighter often faster).\n"
+        "Examples: survival horror game -> deep crimson, near-black burgundy, sickly yellow-green, cold gray-blue; "
+        "underwater documentary -> deep blue, cyan, bioluminescent blue-green; "
+        "cozy reading -> warm amber, soft orange, dim gold.\n"
+        'Reply with JSON only, no markdown: {"colors_hex": ["#RRGGBB", "#RRGGBB"], "speed": 2.0}\n'
+        "Include speed only when it clearly fits the mood; omit speed if unsure."
+    )
+    try:
+        response = ask_lmstudio(prompt)
+        raw = (response.get("output") or [{}])[0].get("content", "").strip()
+        if not raw:
+            return None
+        if raw.startswith("```"):
+            parts = raw.split("```")
+            if len(parts) >= 2:
+                raw = parts[1].strip()
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return None
+        arr = obj.get("colors_hex")
+        if not isinstance(arr, list):
+            return None
+        out: list[str] = []
+        for c in arr[:6]:
+            s = str(c).strip()
+            if s.startswith("#") and len(s) == 7:
+                try:
+                    int(s[1:], 16)
+                    out.append(s.upper())
+                except ValueError:
+                    continue
+            elif len(s) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in s):
+                try:
+                    int(s, 16)
+                    out.append("#" + s.upper())
+                except ValueError:
+                    continue
+        if len(out) < 2:
+            return None
+        theme_sp: float | None = None
+        sp = obj.get("speed")
+        if isinstance(sp, (int, float)) and not isinstance(sp, bool):
+            theme_sp = max(0.1, min(5.0, float(sp)))
+        elif isinstance(sp, str):
+            try:
+                theme_sp = max(0.1, min(5.0, float(sp.strip())))
+            except ValueError:
+                pass
+        return out, theme_sp
+    except Exception as e:
+        log_fn(f"Flow palette from reference failed: {e}")
+    return None
+
+
 _LAST_NANOLEAF_FLOW_BY_USER: dict[str, dict[str, Any]] = {}
 
 
@@ -238,30 +312,159 @@ def clear_last_nanoleaf_flow(user_name: str | None = None) -> None:
     _LAST_NANOLEAF_FLOW_BY_USER.pop(_flow_state_user_key(user_name), None)
 
 
-def infer_flow_colors_hex(user_text: str) -> list[str]:
+# Color names -> hex for inferring Nanoleaf flow palettes from free text.
+# Longer keys matched first so e.g. "light blue" wins over "blue" when we add phrases.
+_FLOW_NAMED_HEX: dict[str, str] = {
+    "light blue": "#87CEEB",
+    "sky blue": "#87CEEB",
+    "royal blue": "#4169E1",
+    "navy": "#000080",
+    "navy blue": "#000080",
+    "baby blue": "#89CFF0",
+    "turquoise": "#40E0D0",
+    "aqua": "#00FFFF",
+    "cyan": "#00BCD4",
+    "teal": "#008080",
+    "mint": "#98FF98",
+    "forest": "#228B22",
+    "forest green": "#228B22",
+    "lime": "#32CD32",
+    "olive": "#808000",
+    "emerald": "#50C878",
+    "chartreuse": "#7FFF00",
+    "neon green": "#39FF14",
+    "hot pink": "#FF69B4",
+    "magenta": "#FF00FF",
+    "fuchsia": "#FF00FF",
+    "violet": "#8B00FF",
+    "indigo": "#4B0082",
+    "lavender": "#E6E6FA",
+    "crimson": "#DC143C",
+    "scarlet": "#FF2400",
+    "maroon": "#800000",
+    "burgundy": "#800020",
+    "coral": "#FF7F50",
+    "peach": "#FFCBA4",
+    "salmon": "#FA8072",
+    "tan": "#D2B48C",
+    "beige": "#F5F5DC",
+    "ivory": "#FFFFF0",
+    "cream": "#FFFDD0",
+    "silver": "#C0C0C0",
+    "charcoal": "#36454F",
+    "gray": "#808080",
+    "grey": "#808080",
+    "black": "#222222",
+    "white": "#F5F5F5",
+    "gold": "#FFD700",
+    "amber": "#FFBF00",
+    "bronze": "#CD7F32",
+    "copper": "#B87333",
+    "rose": "#FF007F",
+    "red": "#FF0000",
+    "orange": "#FF8800",
+    "yellow": "#FFEB3B",
+    "green": "#00C853",
+    "blue": "#2196F3",
+    "purple": "#9C27B0",
+    "pink": "#FF69B4",
+}
+
+
+def _ordered_named_colors_from_text(t: str) -> list[str]:
     """
-    When the planner/router omitted hex colors, derive a palette from the user's words.
-    Returns 2–6 #RRGGBB strings suitable for Nanoleaf flow effects.
+    Find color words in user text in left-to-right order; dedupe adjacent duplicates.
+    Uses word boundaries so 'blue' does not match inside 'bluetooth'.
+    """
+    t = (t or "").lower()
+    names = sorted(_FLOW_NAMED_HEX.keys(), key=len, reverse=True)
+    matches: list[tuple[int, str]] = []
+    for name in names:
+        hx = _FLOW_NAMED_HEX[name]
+        for m in re.finditer(rf"\b{re.escape(name)}\b", t):
+            matches.append((m.start(), hx))
+    matches.sort(key=lambda x: x[0])
+    out: list[str] = []
+    for _, hx in matches:
+        if not out or out[-1] != hx:
+            out.append(hx)
+    return out[:6]
+
+
+def _hex_to_rgb(h: str) -> tuple[int, int, int]:
+    s = h.strip()
+    if s.startswith("#") and len(s) == 7:
+        return int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16)
+    return 255, 255, 255
+
+
+def _pair_single_color_flow(hex_color: str) -> list[str]:
+    """If only one color was named, add a second stop by rotating hue (~45°) so flow still works."""
+    r, g, b = _hex_to_rgb(hex_color)
+    h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+    h2 = (h + 45.0 / 360.0) % 1.0
+    r2, g2, b2 = colorsys.hsv_to_rgb(h2, max(0.35, s), max(0.45, v))
+    second = "#{:02X}{:02X}{:02X}".format(
+        int(r2 * 255) & 255,
+        int(g2 * 255) & 255,
+        int(b2 * 255) & 255,
+    )
+    return [hex_color.upper() if hex_color.startswith("#") else "#" + hex_color, second]
+
+
+def resolve_nanoleaf_flow_colors(
+    user_text: str,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[list[str], float]:
+    """
+    Build flow palette and a speed value from user text.
+    Uses infer_flow_speed for keyword-based pacing; when the thematic LLM runs, its optional speed
+    overrides that baseline for the same message.
     """
     t = (user_text or "").lower()
-    if "rainbow" in t or "pride" in t:
-        return ["#FF0000", "#FF8800", "#FFFF00", "#00FF00", "#0088FF", "#8800FF"]
-    if "red" in t and "blue" in t:
-        return ["#FF0000", "#0000FF"]
-    if "red" in t and "yellow" in t:
-        return ["#FF0000", "#FFDD00"]
-    if "red" in t and "green" in t:
-        return ["#FF0000", "#00FF00"]
-    if "blue" in t and "green" in t:
-        return ["#0000FF", "#00FF00"]
-    if "purple" in t and "orange" in t:
-        return ["#800080", "#FFA500"]
-    if "sunset" in t:
-        return ["#FF4500", "#FF8C00", "#FFD700"]
-    if "ocean" in t or "sea" in t:
-        return ["#001830", "#0066CC", "#00CED1"]
-    # Generic multi-color flow
-    return ["#FF0080", "#00FFCC", "#FFCC00", "#6600FF"]
+    raw_ctx = (user_text or "").strip()
+    base_speed = infer_flow_speed(user_text)
+
+    if "rainbow" in t:
+        return (
+            ["#FF0000", "#FF8800", "#FFFF00", "#00FF00", "#0088FF", "#8800FF"],
+            base_speed,
+        )
+    if re.search(r"\bsunset\b", t):
+        return (["#FF4500", "#FF8C00", "#FFD700"], base_speed)
+    if re.search(r"\bocean\b", t) or re.search(r"\bsea\b", t):
+        return (["#001830", "#0066CC", "#00CED1"], base_speed)
+
+    ordered = _ordered_named_colors_from_text(t)
+    if len(ordered) >= 2:
+        return ordered, base_speed
+    if len(ordered) == 1:
+        return _pair_single_color_flow(ordered[0]), base_speed
+
+    if log_fn is not None and len(raw_ctx) >= 12:
+        picked = pick_flow_palette_for_reference(raw_ctx, log_fn)
+        if picked:
+            themed_colors, theme_sp = picked
+            log_fn(f"Infer flow: thematic palette from reference ({len(themed_colors)} colors).")
+            spd = theme_sp if theme_sp is not None else base_speed
+            return themed_colors, spd
+
+    return ["#4A90D9", "#7EC8E3"], base_speed
+
+
+def infer_flow_colors_hex(
+    user_text: str,
+    log_fn: Callable[[str], None] | None = None,
+) -> list[str]:
+    """
+    When the planner/router omitted hex colors, build a palette from the user's text.
+    Named colors are matched via _FLOW_NAMED_HEX (word-boundary, longest-first, left-to-right);
+    each match maps to one hex, then the list is combined (deduping adjacent duplicates).
+    Special presets: rainbow, sunset, ocean/sea. Single named color -> paired with a hue-shifted second stop.
+    If no named colors match and log_fn is set, asks the LLM to infer colors from thematic references
+    (games, movies, mood, etc.). Returns 2–6 #RRGGBB strings suitable for Nanoleaf flow effects.
+    """
+    return resolve_nanoleaf_flow_colors(user_text, log_fn)[0]
 
 
 def try_handle_lighting_action(
@@ -455,7 +658,7 @@ def try_handle_lighting_action(
             "rainbow" in dl and ("animation" in dl or "flow" in dl or "cycle" in dl)
         )
         if wants_flow:
-            hex_list = infer_flow_colors_hex(description)
+            hex_list, flow_speed = resolve_nanoleaf_flow_colors(description, engine.log)
             colors_rgb: list[tuple[int, int, int]] = []
             for s in hex_list[:6]:
                 try:
@@ -463,7 +666,6 @@ def try_handle_lighting_action(
                 except ValueError:
                     pass
             if len(colors_rgb) >= 2:
-                flow_speed = infer_flow_speed(description)
                 try:
                     ok = nanoleaf.create_flow_effect(colors_rgb, flow_speed)
                     if ok:
@@ -615,8 +817,10 @@ def try_handle_lighting_action(
                     hex_list.append(s.upper())
                 elif len(s) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in s):
                     hex_list.append("#" + s.upper())
+        inferred_colors_speed: tuple[list[str], float] | None = None
         if len(hex_list) < 2:
-            hex_list = infer_flow_colors_hex(desc or user_text or "")
+            inferred_colors_speed = resolve_nanoleaf_flow_colors(desc or user_text or "", engine.log)
+            hex_list = inferred_colors_speed[0]
         colors_rgb: list[tuple[int, int, int]] = []
         for s in hex_list[:6]:
             try:
@@ -633,7 +837,10 @@ def try_handle_lighting_action(
             except (TypeError, ValueError):
                 speed = None
             if speed is None:
-                speed = infer_flow_speed(f"{desc} {user_text}")
+                if inferred_colors_speed is not None:
+                    speed = inferred_colors_speed[1]
+                else:
+                    speed = infer_flow_speed(f"{desc} {user_text}")
             speed = max(0.1, min(5.0, round(speed, 2)))
             try:
                 ok = nanoleaf.create_flow_effect(colors_rgb, speed)
